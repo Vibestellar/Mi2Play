@@ -371,6 +371,15 @@ impl MiPlaySession {
                 Err(error) => return Err(error),
             };
             let command_id = (u16::from(frame.outer) << 8) | u16::from(frame.command);
+            tracing::debug!(
+                peer = %self.peer,
+                outer = frame.outer,
+                command = frame.command,
+                sequence = frame.sequence,
+                encrypted = frame.encrypted,
+                body_bytes = frame.body.len(),
+                "MiPlay control frame received"
+            );
             match (frame.outer, frame.command) {
                 (0, GET_VERSION) => {
                     write_frame(
@@ -391,6 +400,12 @@ impl MiPlaySession {
                         numeric_device_id(&self.identity.id).as_bytes(),
                     )
                     .await?;
+                    tracing::debug!(
+                        sequence = frame.sequence,
+                        "MiPlay device identity acknowledged"
+                    );
+                }
+                (0, AUTH_ACK) => {
                     write_frame(
                         &mut self.stream,
                         0,
@@ -417,7 +432,7 @@ impl MiPlaySession {
                     .await?;
                     tracing::debug!(
                         sequence = frame.sequence,
-                        "MiPlay identity and capabilities sent"
+                        "MiPlay capabilities sent after AUTH_ACK"
                     );
                 }
                 (0, SAFETY_INFO) if !frame.encrypted => {
