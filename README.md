@@ -12,7 +12,8 @@ Mi2Play 是一个以 Rust 编写的跨平台实验性桥接器：将局域网中
 - 已实现：CLI 启动时广播带稳定实例名和 MiPlay TXT 能力字段的
   `_lyra-mdns._udp.local.` 与 `_mi-connect._udp.local.` 服务；`_mi-connect`
   的发现 SRV 使用 UDP 56666，真实 TCP 控制端口 8899 写入 `appsData`；程序
-  同时实际监听 UDP 56666 接收手机的发现探测。
+  同时实际监听 UDP 56666 接收手机的发现探测。两个服务使用不同的稳定实例名，
+  不再把服务类型本身错误地当作实例名。
 - 已实现：AirPlay 1 RTSP Digest/密码认证、RTP timing 响应、丢包控制包重传和 `_raop._tcp` 自动发现。
 - 已实现：周期性 AirPlay RTP sync 包和跨序号回绕的重传处理。
 - 尚未完成：真实设备集成测试。

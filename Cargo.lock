@@ -517,6 +517,7 @@ dependencies = [
  "mi2play-core",
  "mi2play-miplay",
  "serde",
+ "sha2",
  "thiserror",
  "tokio",
  "toml",

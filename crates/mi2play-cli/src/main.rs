@@ -5,6 +5,7 @@ use mi2play_airplay::{PcmAudioFrame, PcmToRaop, RaopClient, RaopEndpoint, discov
 use mi2play_core::DeviceRegistry;
 use mi2play_miplay::{MiPlayServer, SessionEvent};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{fs, net::SocketAddr, path::PathBuf};
@@ -304,17 +305,32 @@ fn advertise_miplay(
     listen.ip().hash(&mut hasher);
     let id = format!("{:016x}", hasher.finish());
     let hostname = format!("mi2play-{id}.local.");
-    let instance = format!("{}({})", sanitize_dns_label(name), &id[..10]);
-    let apps_data = build_apps_data(listen.port(), &id);
+    let lyra_instance = id[id.len() - 8..].to_ascii_uppercase();
+    let mi_connect_instance = format!("{}({})", sanitize_dns_label(name), &id[..10]);
+    let device_id = format!("{id}{id}");
+    let digest = Sha256::digest(device_id.as_bytes());
+    let id_hash = BASE64.encode(&digest[..3]);
+    let apps_data = build_apps_data(listen.port(), &device_id);
     let properties = [
+        ("version", "196608"),
+        ("apps", "[5]"),
+        ("flags", "CgE="),
+        ("name", name),
+        ("idHash", id_hash.as_str()),
+        ("dev", "4"),
+        ("sec", "2"),
+        ("appsData", apps_data.as_str()),
+        ("commonData", "0"),
+    ];
+    let lyra_properties = [
         ("version", "65545"),
         ("apps", "[5]"),
         ("flags", "Ag=="),
         ("name", name),
-        ("idHash", "bWky"),
+        ("idHash", id_hash.as_str()),
         ("dev", "4"),
         ("sec", "2"),
-        ("appsData", &apps_data),
+        ("appsData", apps_data.as_str()),
         ("commonData", "0"),
     ];
     let daemon = ServiceDaemon::new()?;
@@ -322,22 +338,32 @@ fn advertise_miplay(
         daemon.disable_interface(mdns_sd::IfKind::IPv6)?;
     }
     for (service_type, service_name, port) in [
-        ("_lyra-mdns._udp.local.", "_lyra-mdns._udp.local", 5353),
-        ("_mi-connect._udp.local.", instance.as_str(), 56666),
+        ("_lyra-mdns._udp.local.", lyra_instance.as_str(), 5353),
+        (
+            "_mi-connect._udp.local.",
+            mi_connect_instance.as_str(),
+            56666,
+        ),
     ] {
+        let service_properties = if service_type.starts_with("_lyra") {
+            &lyra_properties[..]
+        } else {
+            &properties[..]
+        };
         let service = ServiceInfo::new(
             service_type,
             service_name,
             &hostname,
             "",
             port,
-            &properties[..],
+            service_properties,
         )?
         .enable_addr_auto();
         daemon.register(service)?;
     }
     tracing::info!(
-        name = instance,
+        lyra_instance,
+        mi_connect_instance,
         hostname,
         control_port = listen.port(),
         discovery_port = 56666,
@@ -405,14 +431,14 @@ fn sanitize_dns_label(value: &str) -> String {
     label.trim_matches('-').to_owned()
 }
 
-fn build_apps_data(control_port: u16, id: &str) -> String {
+fn build_apps_data(control_port: u16, device_id: &str) -> String {
     let mut payload = vec![0u8; 25];
     payload[0..2].copy_from_slice(&1155u16.to_be_bytes());
     payload[2..4].copy_from_slice(&control_port.to_be_bytes());
-    for (index, byte) in id.as_bytes().iter().take(6).enumerate() {
-        payload[5 + index] = *byte;
-    }
-    let identity = format!(r#"{{"mico":{{"device_id":"{}"}}}}"#, id);
+    let digest = Sha256::digest(device_id.as_bytes());
+    payload[4] = (digest[0] & 0xfc) | 2;
+    payload[5..10].copy_from_slice(&digest[1..6]);
+    let identity = format!(r#"{{"mico":{{"device_id":"{}"}}}}"#, device_id);
     payload.extend_from_slice(identity.as_bytes());
     let mut container = vec![0x81, 0x00, payload.len() as u8];
     container.extend_from_slice(&payload);
