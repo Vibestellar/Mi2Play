@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::{fs, net::SocketAddr, path::PathBuf};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, stdin};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -181,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen,
         file.ipv6.unwrap_or(args.ipv6),
     )?;
+    let _mi_connect_probe = spawn_mi_connect_probe_listener(file.ipv6.unwrap_or(args.ipv6)).await?;
     let player_filter = file.player_filter.as_ref().unwrap_or(&args.player_filter);
     let raop_address = if configured_raop.is_some() {
         configured_raop
@@ -342,6 +344,47 @@ fn advertise_miplay(
         "MiPlay mDNS services advertised"
     );
     Ok(daemon)
+}
+
+async fn spawn_mi_connect_probe_listener(
+    ipv6: bool,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, std::io::Error> {
+    let mut listeners = Vec::new();
+    let socket = UdpSocket::bind(("0.0.0.0", 56666)).await?;
+    tracing::info!(address = %socket.local_addr()?, "MiPlay discovery UDP listener started");
+    listeners.push(tokio::spawn(async move {
+        let mut buffer = [0u8; 2048];
+        loop {
+            match socket.recv_from(&mut buffer).await {
+                Ok((length, peer)) => {
+                    tracing::debug!(%peer, bytes = length, "MiPlay discovery UDP probe received");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "MiPlay discovery UDP listener stopped");
+                    break;
+                }
+            }
+        }
+    }));
+    if ipv6 {
+        let socket = UdpSocket::bind(("[::]", 56666)).await?;
+        tracing::info!(address = %socket.local_addr()?, "MiPlay IPv6 discovery UDP listener started");
+        listeners.push(tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            loop {
+                match socket.recv_from(&mut buffer).await {
+                    Ok((length, peer)) => {
+                        tracing::debug!(%peer, bytes = length, "MiPlay IPv6 discovery UDP probe received");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "MiPlay IPv6 discovery UDP listener stopped");
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    Ok(listeners)
 }
 
 fn sanitize_dns_label(value: &str) -> String {
