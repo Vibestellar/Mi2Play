@@ -433,13 +433,27 @@ async fn bridge_session(
             tracing::debug!(%error, %peer, "MiPlay connection closed");
         }
     });
-    let mut client =
-        RaopClient::connect_with_password(&endpoint, sample_rate, channels, password.as_deref())
-            .await?;
-    let mut bridge = PcmToRaop::new(sample_rate, channels)?;
+    let mut client = None;
+    let mut bridge = None;
     while let Some(event) = events_rx.recv().await {
         match event {
             SessionEvent::Audio(frame) => {
+                if client.is_none() {
+                    tracing::info!(
+                        endpoint = %endpoint.address,
+                        "MiPlay audio received; connecting to RAOP receiver"
+                    );
+                    client = Some(
+                        RaopClient::connect_with_password(
+                            &endpoint,
+                            sample_rate,
+                            channels,
+                            password.as_deref(),
+                        )
+                        .await?,
+                    );
+                    bridge = Some(PcmToRaop::new(sample_rate, channels)?);
+                }
                 tracing::trace!(
                     sequence = frame.sequence,
                     timestamp = frame.timestamp,
@@ -447,8 +461,10 @@ async fn bridge_session(
                     "Bridging MiPlay PCM to RAOP"
                 );
                 client
+                    .as_mut()
+                    .expect("RAOP client initialized for audio")
                     .send_pcm(
-                        &mut bridge,
+                        bridge.as_mut().expect("PCM bridge initialized for audio"),
                         PcmAudioFrame {
                             sequence: frame.sequence,
                             timestamp: frame.timestamp,
@@ -460,12 +476,22 @@ async fn bridge_session(
                     .await?;
             }
             SessionEvent::Command { command, payload } => match command & 0xff {
-                0x04 => client.pause().await?,
-                0x06 => client.resume().await?,
+                0x04 => {
+                    if let Some(client) = client.as_mut() {
+                        client.pause().await?;
+                    }
+                }
+                0x06 => {
+                    if let Some(client) = client.as_mut() {
+                        client.resume().await?;
+                    }
+                }
                 0x0c => {
                     if let Some(&volume) = payload.first() {
                         tracing::debug!(volume, "Applying MiPlay volume to RAOP");
-                        client.set_volume(RaopClient::volume_db(volume)).await?;
+                        if let Some(client) = client.as_mut() {
+                            client.set_volume(RaopClient::volume_db(volume)).await?;
+                        }
                     }
                 }
                 0x08 => break,
@@ -474,6 +500,8 @@ async fn bridge_session(
             SessionEvent::Disconnected => break,
         }
     }
-    client.stop().await?;
+    if let Some(client) = client {
+        client.stop().await?;
+    }
     Ok(())
 }
