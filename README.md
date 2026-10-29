@@ -38,7 +38,8 @@ cargo run -p mi2play-cli -- --listen 0.0.0.0:8899 --raop-address 192.168.1.20:70
 `--player-filter` 的 AirPlay 1 接收器；密码设备可通过
 `MI2PLAY_RAOP_PASSWORD` 或 `--raop-password` 配置。
 
-真实联调建议使用 `RUST_LOG=mi2play=debug`；`trace` 级别还会记录 PCM/RTP
+真实联调可使用 `--log-level debug`；也支持 `RUST_LOG=mi2play=debug` 覆盖默认级别。
+`trace` 级别还会记录 PCM/RTP
 序号、timestamp、包大小、timing、重传和 RTSP 状态，但不会输出密码、AES
 密钥或认证正文。日志目前足以区分发现、连接、认证、SETUP、音频帧、时钟、
 重传和断开阶段；仍需要真实设备日志来确认具体厂商字段和时序。

@@ -164,8 +164,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = load_file(args.config.as_ref())?;
     validate(&args, &file)?;
     let level = file.log_level.unwrap_or(args.log_level);
+    let default_filter = format!(
+        "mi2play={},mi2play_miplay={},mi2play_airplay={}",
+        level.as_str(),
+        level.as_str(),
+        level.as_str()
+    );
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(level.as_str()))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
+        )
         .init();
 
     let _registry = DeviceRegistry::default();

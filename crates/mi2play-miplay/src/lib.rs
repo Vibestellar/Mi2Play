@@ -371,7 +371,7 @@ impl MiPlaySession {
                 Err(error) => return Err(error),
             };
             let command_id = (u16::from(frame.outer) << 8) | u16::from(frame.command);
-            tracing::debug!(
+            tracing::info!(
                 peer = %self.peer,
                 outer = frame.outer,
                 command = frame.command,
