@@ -510,6 +510,7 @@ dependencies = [
 name = "mi2play-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "mdns-sd",
  "mi2play-airplay",

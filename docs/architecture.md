@@ -153,7 +153,9 @@ player = "HomePod"
 - 当前实现已提供 PCM 数据面适配：`PcmAudioFrame` 接收交错 little-endian 16-bit PCM，经有界分块和 ALAC 编码后送入 RAOP RTP；CLI 用 `--pcm-stdin` 验证该路径。真实 MiPlay 网络会话仍需将解出的 PCM 帧接到该入口。
 - `mi2play-miplay` 现在提供 8899 TCP listener/session：按 FusionPlay.MiPlaySdk 的 9-byte framed protocol 处理 SafetyAuth/AES-CBC/HMAC、控制命令和 `OPEN`，再协商 RTSP WFD 的 RTP/MP2T/TCP 媒体流。
 - RTP 中的 MPEG-TS/PES/AAC-LC 会解码为 48 kHz 双声道 PCM，并通过事件通道交给 `PcmToRaop`；此前伪造的 `PCM_AUDIO_COMMAND` 路径已删除。
-- CLI 会通过 `mdns-sd` 广播 `_lyra-mdns._udp.local.` 与 `_mi-connect._udp.local.`；当前只完成广播骨架，SRV 端口和 8899 listener 的对应关系仍需真实设备抓包校准。
+- CLI 会通过 `mdns-sd` 广播带稳定实例名和 TXT 能力字段的
+  `_lyra-mdns._udp.local.` 与 `_mi-connect._udp.local.`；`_mi-connect` 的
+  SRV 发现端口为 UDP 56666，真实 TCP 8899 控制端口通过 `appsData` 描述。
 - RAOP ANNOUNCE 使用固定 AirPlay RSA 公钥封装随机 AES-128 key/IV，RTP ALAC payload 按 AES-CBC 加密，并发送标准 RTP-Info/设备标识头；这不是 AirPlay 2/HAP Pair-Verify 配对。
 - AirPlay 1 已支持 RTSP Digest/密码认证、RTP timing 响应、control 丢包请求和 512 包重传缓存，并可浏览 `_raop._tcp` 自动选择播放器。
 - 播放期间每秒发送 RTP sync 包，并维护当前音频 RTP timestamp；timing 响应使用接收端请求的 `send_time` 作为 reference。

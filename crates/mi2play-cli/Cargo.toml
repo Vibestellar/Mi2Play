@@ -10,6 +10,7 @@ name = "mi2play"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 mdns-sd.workspace = true
 mi2play-airplay.workspace = true
 clap.workspace = true

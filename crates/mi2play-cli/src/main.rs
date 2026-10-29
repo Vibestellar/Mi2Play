@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, ValueEnum};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use mi2play_airplay::{PcmAudioFrame, PcmToRaop, RaopClient, RaopEndpoint, discover_raop};
@@ -301,39 +302,78 @@ fn advertise_miplay(
     listen.ip().hash(&mut hasher);
     let id = format!("{:016x}", hasher.finish());
     let hostname = format!("mi2play-{id}.local.");
+    let instance = format!("{}({})", sanitize_dns_label(name), &id[..10]);
+    let apps_data = build_apps_data(listen.port(), &id);
     let properties = [
-        ("version", "1"),
-        ("apps", "MiPlay"),
-        ("flags", "0"),
+        ("version", "65545"),
+        ("apps", "[5]"),
+        ("flags", "Ag=="),
         ("name", name),
-        ("idHash", &id[..8]),
-        ("dev", "mi2play"),
-        ("sec", "0"),
-        ("appsData", ""),
+        ("idHash", "bWky"),
+        ("dev", "4"),
+        ("sec", "2"),
+        ("appsData", &apps_data),
+        ("commonData", "0"),
     ];
     let daemon = ServiceDaemon::new()?;
     if !ipv6 {
         daemon.disable_interface(mdns_sd::IfKind::IPv6)?;
     }
-    for service_type in ["_lyra-mdns._udp.local.", "_mi-connect._udp.local."] {
+    for (service_type, service_name, port) in [
+        ("_lyra-mdns._udp.local.", "_lyra-mdns._udp.local", 5353),
+        ("_mi-connect._udp.local.", instance.as_str(), 56666),
+    ] {
         let service = ServiceInfo::new(
             service_type,
-            name,
+            service_name,
             &hostname,
             "",
-            listen.port(),
+            port,
             &properties[..],
         )?
         .enable_addr_auto();
         daemon.register(service)?;
     }
     tracing::info!(
-        name,
+        name = instance,
         hostname,
-        port = listen.port(),
+        control_port = listen.port(),
+        discovery_port = 56666,
         "MiPlay mDNS services advertised"
     );
     Ok(daemon)
+}
+
+fn sanitize_dns_label(value: &str) -> String {
+    let mut label: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if label.is_empty() {
+        label.push_str("Mi2Play");
+    }
+    label.truncate(45);
+    label.trim_matches('-').to_owned()
+}
+
+fn build_apps_data(control_port: u16, id: &str) -> String {
+    let mut payload = vec![0u8; 25];
+    payload[0..2].copy_from_slice(&1155u16.to_be_bytes());
+    payload[2..4].copy_from_slice(&control_port.to_be_bytes());
+    for (index, byte) in id.as_bytes().iter().take(6).enumerate() {
+        payload[5 + index] = *byte;
+    }
+    let identity = format!(r#"{{"mico":{{"device_id":"{}"}}}}"#, id);
+    payload.extend_from_slice(identity.as_bytes());
+    let mut container = vec![0x81, 0x00, payload.len() as u8];
+    container.extend_from_slice(&payload);
+    BASE64.encode(container)
 }
 
 async fn bridge_session(
