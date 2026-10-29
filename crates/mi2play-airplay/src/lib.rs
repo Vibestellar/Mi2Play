@@ -360,6 +360,12 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
                 backlog.pop_front();
             }
         }
+        tracing::trace!(
+            sequence = packet.sequence,
+            timestamp = packet.timestamp,
+            payload_bytes = packet.payload.len(),
+            "RAOP RTP audio packet"
+        );
         self.audio.send(&rtp).await?;
         self.next_sequence = packet.sequence.wrapping_add(1);
         self.next_timestamp = packet.timestamp;
@@ -450,12 +456,14 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
                             });
                             if let Some(mut packet) = packet {
                                 packet[1] = 0xd6;
+                                tracing::debug!(sequence = missing, "RAOP RTP packet retransmit");
                                 let _ = control.send(&packet).await;
                             }
                         }
                     }
                     _ = sync_interval.tick() => {
                         let timestamp = stream_timestamp.load(Ordering::Relaxed);
+                        tracing::trace!(timestamp, "RAOP RTP sync packet");
                         let _ = control.send(&build_sync_packet(timestamp, sample_rate, false)).await;
                     }
                 }
@@ -481,6 +489,7 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
                 response[1] = 0xd3;
                 response[8..16].copy_from_slice(&request[24..32]);
                 let now = ntp_now();
+                tracing::trace!("RAOP RTP timing response");
                 response[16..24].copy_from_slice(&now);
                 response[24..32].copy_from_slice(&now);
                 let _ = timing.send(&response).await;
@@ -513,6 +522,12 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
         self.rtsp.write_all(request.as_bytes()).await?;
         self.cseq += 1;
         let response = read_response(&mut self.rtsp).await?;
+        tracing::debug!(
+            method,
+            cseq = self.cseq - 1,
+            status = response.status,
+            "RAOP RTSP response"
+        );
         if response.status == 401 {
             let Some(password) = self.password.as_deref() else {
                 return Err(RaopError::RequestFailed {
@@ -562,6 +577,12 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
             self.rtsp.write_all(retry.as_bytes()).await?;
             self.cseq += 1;
             let response = read_response(&mut self.rtsp).await?;
+            tracing::debug!(
+                method,
+                cseq = self.cseq - 1,
+                status = response.status,
+                "RAOP RTSP authenticated response"
+            );
             if !(200..300).contains(&response.status) {
                 return Err(RaopError::RequestFailed {
                     status: response.status,

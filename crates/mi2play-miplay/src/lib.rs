@@ -347,6 +347,7 @@ impl MiPlaySession {
     }
 
     pub async fn run(mut self, events: mpsc::Sender<SessionEvent>) -> Result<(), ProtocolError> {
+        tracing::info!(peer = %self.peer_addr(), "MiPlay session started");
         let local = self.stream.local_addr()?;
         let key = auth_key(local, self.peer);
         let mut cipher = Cipher::new(key);
@@ -589,6 +590,11 @@ impl MiPlaySession {
                     .await?;
                 }
                 _ => {
+                    tracing::debug!(
+                        command = command_id,
+                        sequence = frame.sequence,
+                        "MiPlay control command"
+                    );
                     let _ = events
                         .send(SessionEvent::Command {
                             command: command_id,
@@ -598,6 +604,11 @@ impl MiPlaySession {
                 }
             }
             if matches!(frame.command, PAUSE | RESUME | SET_VOLUME) {
+                tracing::debug!(
+                    command = command_id,
+                    sequence = frame.sequence,
+                    "MiPlay playback command"
+                );
                 let _ = events
                     .send(SessionEvent::Command {
                         command: command_id,
@@ -781,6 +792,7 @@ async fn receive_rtp(
         for ts in payload.chunks_exact(188) {
             for aac in demuxer.push(ts)? {
                 let pcm = decode_aac(&aac)?;
+                let pcm_bytes = pcm.len();
                 events
                     .send(SessionEvent::Audio(PcmAudioFrame {
                         sequence: 0,
@@ -791,6 +803,7 @@ async fn receive_rtp(
                     }))
                     .await
                     .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                tracing::trace!(pcm_bytes, "MiPlay decoded PCM frame");
             }
         }
     }

@@ -503,6 +503,7 @@ dependencies = [
  "sha1",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

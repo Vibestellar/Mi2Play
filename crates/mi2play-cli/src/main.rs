@@ -357,6 +357,12 @@ async fn bridge_session(
     while let Some(event) = events_rx.recv().await {
         match event {
             SessionEvent::Audio(frame) => {
+                tracing::trace!(
+                    sequence = frame.sequence,
+                    timestamp = frame.timestamp,
+                    pcm_bytes = frame.pcm.len(),
+                    "Bridging MiPlay PCM to RAOP"
+                );
                 client
                     .send_pcm(
                         &mut bridge,
@@ -375,6 +381,7 @@ async fn bridge_session(
                 0x06 => client.resume().await?,
                 0x0c => {
                     if let Some(&volume) = payload.first() {
+                        tracing::debug!(volume, "Applying MiPlay volume to RAOP");
                         client.set_volume(RaopClient::volume_db(volume)).await?;
                     }
                 }

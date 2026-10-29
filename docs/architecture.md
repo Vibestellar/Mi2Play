@@ -135,6 +135,11 @@ player = "HomePod"
 
 只有在具备真实小米客户端和 AirPlay 播放器时，才记录发现、认证、音频、控制和重连结果；报告包含型号、OS、网络、音频格式、测量方法和误差。
 
+`.github/workflows/build.yml` 提供 push、pull request 和手动触发的跨平台构建，
+产出 Windows x86/x86_64、macOS x86_64/arm64，以及 Linux x86、x86_64、armv7
+和 aarch64 的 CLI 压缩包。真实联调建议设置 `RUST_LOG=mi2play=debug`；需要
+更细的 RTP/timing/PCM 计数时使用 `trace`，日志不会包含密码或 AES 密钥。
+
 ## 分阶段交付
 
 1. **阶段 1/2**：参考分析、许可证边界、架构和协议风险。
