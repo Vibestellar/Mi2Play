@@ -50,6 +50,9 @@ const HEARTBEAT: u8 = 0x1a;
 const HEARTBEAT_ACK: u8 = 0x1b;
 const GET_STATE: u8 = 0x1c;
 const GET_STATE_ACK: u8 = 0x1d;
+const NOTIFY: u8 = 0x22;
+const SET_DEVICE_INFO: u8 = 0x58;
+const SET_DEVICE_INFO_ACK: u8 = 0x59;
 const SET_PLAY_SOURCE: u8 = 0x40;
 const SET_PLAY_SOURCE_ACK: u8 = 0x41;
 const SET_POSITION: u8 = 0x56;
@@ -385,9 +388,37 @@ impl MiPlaySession {
                         0,
                         AUTH_ACK,
                         frame.sequence,
-                        self.identity.id.as_bytes(),
+                        numeric_device_id(&self.identity.id).as_bytes(),
                     )
                     .await?;
+                    write_frame(
+                        &mut self.stream,
+                        0,
+                        NOTIFY,
+                        5,
+                        &[4, b'm', b'o', b'd', b'e', 3, 2],
+                    )
+                    .await?;
+                    write_frame(
+                        &mut self.stream,
+                        0,
+                        NOTIFY,
+                        6,
+                        &empty_media_info_notification(),
+                    )
+                    .await?;
+                    write_frame(
+                        &mut self.stream,
+                        0,
+                        NOTIFY,
+                        7,
+                        &[5, b's', b't', b'a', b't', 3, 0],
+                    )
+                    .await?;
+                    tracing::debug!(
+                        sequence = frame.sequence,
+                        "MiPlay identity and capabilities sent"
+                    );
                 }
                 (0, SAFETY_INFO) if !frame.encrypted => {
                     let info = br#"{"aesIvType":"2","aesKeyType":"1","authAlgorithmType":"4","authKeyType":"1","integrityType":"1","result":"0"}"#;
@@ -443,6 +474,17 @@ impl MiPlaySession {
                         &mut self.stream,
                         0,
                         GET_DEVICE_INFO_ACK,
+                        frame.sequence,
+                        &encrypted,
+                    )
+                    .await?;
+                }
+                (0, SET_DEVICE_INFO) => {
+                    let encrypted = cipher.encrypt(&[])?;
+                    write_frame(
+                        &mut self.stream,
+                        0,
+                        SET_DEVICE_INFO_ACK,
                         frame.sequence,
                         &encrypted,
                     )
@@ -553,19 +595,20 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, SET_MEDIA_INFO) | (0, GET_MEDIA_INFO) => {
-                    let encrypted = cipher.encrypt(&[])?;
-                    write_frame(
-                        &mut self.stream,
-                        0,
-                        if frame.command == SET_MEDIA_INFO {
-                            SET_MEDIA_INFO_ACK
-                        } else {
-                            GET_MEDIA_INFO
-                        },
-                        frame.sequence,
-                        &encrypted,
-                    )
-                    .await?;
+                    if frame.command == SET_MEDIA_INFO {
+                        let encrypted = cipher.encrypt(&[])?;
+                        write_frame(
+                            &mut self.stream,
+                            0,
+                            SET_MEDIA_INFO_ACK,
+                            frame.sequence,
+                            &encrypted,
+                        )
+                        .await?;
+                    } else {
+                        let notification = cipher.encrypt(&empty_media_info_notification())?;
+                        write_frame(&mut self.stream, 0, NOTIFY, 8, &notification).await?;
+                    }
                 }
                 (0, SET_POSITION) => {
                     let encrypted = cipher.encrypt(&[])?;
@@ -625,10 +668,25 @@ fn parse_stream_keys(value: &Value) -> Option<StreamKeys> {
         let bytes = value.get(name)?.as_str()?.as_bytes();
         bytes.len().eq(&16).then(|| bytes.try_into().ok()).flatten()
     }
+
     Some(StreamKeys {
         stream_key: key(value, "streamKey")?,
         stream_iv: key(value, "streamIV")?,
     })
+}
+
+fn numeric_device_id(id: &str) -> String {
+    let digest = Md5::digest(id.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    format!("{:014}", u64::from_be_bytes(bytes) % 100_000_000_000_000)
+}
+
+fn empty_media_info_notification() -> Vec<u8> {
+    vec![
+        0x0b, b'm', b'e', b'd', b'i', b'a', b'I', b'n', b'f', b'o', b'E', b'x', 0x16, 0x00, 0x00,
+        0x00, 0x0c, 0x06, b'm', b'T', b'i', b't', b'l', b'e', 0x14, 0x00, 0x00, 0x00, 0x00,
+    ]
 }
 
 fn parse_wfd_url(value: &str) -> Result<(String, u16), ProtocolError> {
