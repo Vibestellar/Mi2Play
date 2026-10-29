@@ -8,6 +8,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, net::SocketAddr, path::PathBuf};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, stdin};
@@ -307,11 +308,11 @@ fn advertise_miplay(
     let hostname = format!("mi2play-{id}.local.");
     let lyra_instance = id[id.len() - 8..].to_ascii_uppercase();
     let mi_connect_instance = format!("{}({})", sanitize_dns_label(name), &id[..10]);
-    let device_id = format!("{id}{id}");
+    let device_id = device_uuid(&id);
     let digest = Sha256::digest(device_id.as_bytes());
     let id_hash = BASE64.encode(&digest[..3]);
     let apps_data = build_apps_data(listen.port(), &device_id);
-    let properties = [
+    let mi_connect_properties = [
         ("version", "196608"),
         ("apps", "[5]"),
         ("flags", "CgE="),
@@ -322,16 +323,16 @@ fn advertise_miplay(
         ("appsData", apps_data.as_str()),
         ("commonData", "0"),
     ];
+    let advertised_ip = advertised_ipv4(listen);
+    let lyra_app_data = build_lyra_app_data(name, &lyra_instance, listen);
+    let debug_info = format!("{{msg:reply, ifname:unknown, v4:{advertised_ip}}}");
+    let timestamp = unix_millis().to_string();
     let lyra_properties = [
-        ("version", "65545"),
-        ("apps", "[5]"),
-        ("flags", "Ag=="),
-        ("name", name),
-        ("idHash", id_hash.as_str()),
-        ("dev", "4"),
-        ("sec", "2"),
-        ("appsData", apps_data.as_str()),
-        ("commonData", "0"),
+        ("AppData", lyra_app_data.as_str()),
+        ("MediumType", "8192"),
+        ("CH", "0"),
+        ("DebugInfo", debug_info.as_str()),
+        ("TS", timestamp.as_str()),
     ];
     let daemon = ServiceDaemon::new()?;
     if !ipv6 {
@@ -348,7 +349,7 @@ fn advertise_miplay(
         let service_properties = if service_type.starts_with("_lyra") {
             &lyra_properties[..]
         } else {
-            &properties[..]
+            &mi_connect_properties[..]
         };
         let service = ServiceInfo::new(
             service_type,
@@ -365,6 +366,7 @@ fn advertise_miplay(
         lyra_instance,
         mi_connect_instance,
         hostname,
+        advertised_ip = %advertised_ip,
         control_port = listen.port(),
         discovery_port = 56666,
         "MiPlay mDNS services advertised"
@@ -443,6 +445,73 @@ fn build_apps_data(control_port: u16, device_id: &str) -> String {
     let mut container = vec![0x81, 0x00, payload.len() as u8];
     container.extend_from_slice(&payload);
     BASE64.encode(container)
+}
+
+fn device_uuid(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:02x}{:02x}-\
+         {:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        digest[4],
+        digest[5],
+        digest[6] & 0x0f,
+        digest[7],
+        (digest[8] & 0x3f) | 0x80,
+        digest[9],
+        digest[10],
+        digest[11],
+        digest[12],
+        digest[13],
+        digest[14],
+        digest[15]
+    )
+}
+
+fn build_lyra_app_data(name: &str, instance: &str, listen: SocketAddr) -> String {
+    let mut payload = vec![0x00, 0x40, 0x03];
+    let instance_bytes = u32::from_str_radix(instance, 16)
+        .unwrap_or_default()
+        .to_be_bytes();
+    payload.extend_from_slice(&instance_bytes);
+    payload.extend_from_slice(&[
+        0x00, 0x05, 0x19, 0x24, 0x10, 0x01, 0x03, 0x0a, 0x03, 0x01, 0xda, 0xae, 0x01, 0x01, 0x80,
+        0x02,
+    ]);
+    let name = name.as_bytes();
+    let length = name.len().min(63);
+    payload.push(length as u8);
+    payload.extend_from_slice(&name[..length]);
+    payload.extend_from_slice(&[0x25, 0x01, 0x03]);
+    let _ = listen;
+    BASE64.encode(payload)
+}
+
+fn advertised_ipv4(listen: SocketAddr) -> std::net::Ipv4Addr {
+    if let SocketAddr::V4(address) = listen {
+        if !address.ip().is_unspecified() {
+            return *address.ip();
+        }
+    }
+    let Ok(socket) = std::net::UdpSocket::bind(("0.0.0.0", 0)) else {
+        return std::net::Ipv4Addr::UNSPECIFIED;
+    };
+    if socket.connect(("192.168.1.1", 9)).is_ok() {
+        if let Ok(SocketAddr::V4(address)) = socket.local_addr() {
+            return *address.ip();
+        }
+    }
+    std::net::Ipv4Addr::UNSPECIFIED
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 async fn bridge_session(
