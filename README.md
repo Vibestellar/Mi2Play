@@ -9,7 +9,7 @@ Mi2Play 是一个以 Rust 编写的跨平台实验性桥接器：将局域网中
 - 已完成：参考仓库职责、许可证边界、AirConnect 功能映射和总体架构（见 `docs/reference-analysis.md`、`docs/architecture.md`）。
 - 实现中：配置解析、设备映射、MiPlay 帧编解码和可验证状态机。
 - 已实现：`mi2play-airplay` 的 RAOP RTSP 会话、RSA 封装 AES-128-CBC RTP 音频发送和基本播放控制。
-- 已实现：CLI 启动时广播 `_lyra-mdns._udp` 与 `_mi-connect._udp` mDNS 服务（发现端口和真实 MiPlay 端口仍需按设备抓包校准）。
+- 已实现：CLI 启动时广播 `_lyra-mdns._udp.local.` 与 `_mi-connect._udp.local.` mDNS 服务（发现端口和真实 MiPlay 端口仍需按设备抓包校准）。
 - 已实现：AirPlay 1 RTSP Digest/密码认证、RTP timing 响应、丢包控制包重传和 `_raop._tcp` 自动发现。
 - 已实现：周期性 AirPlay RTP sync 包和跨序号回绕的重传处理。
 - 尚未完成：真实设备集成测试。

@@ -315,7 +315,7 @@ fn advertise_miplay(
     if !ipv6 {
         daemon.disable_interface(mdns_sd::IfKind::IPv6)?;
     }
-    for service_type in ["_lyra-mdns._udp", "_mi-connect._udp"] {
+    for service_type in ["_lyra-mdns._udp.local.", "_mi-connect._udp.local."] {
         let service = ServiceInfo::new(
             service_type,
             name,
