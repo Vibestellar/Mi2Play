@@ -359,6 +359,15 @@ impl MiPlaySession {
         let own_challenge = hex::encode(own_challenge);
         let mut pending_auth: Option<(u16, Vec<u8>)> = None;
         let mut stream_keys = None;
+        write_frame(
+            &mut self.stream,
+            0,
+            DEVICE_ID,
+            4,
+            numeric_device_id(&self.identity.id).as_bytes(),
+        )
+        .await?;
+        tracing::info!("MiPlay device identity announced");
         loop {
             let frame = match read_frame(&mut self.stream, &mut cipher).await {
                 Ok(frame) => frame,
