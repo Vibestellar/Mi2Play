@@ -444,9 +444,21 @@ impl MiPlaySession {
                         "MiPlay capabilities sent after AUTH_ACK"
                     );
                 }
-                (0, SAFETY_INFO) if !frame.encrypted => {
+                (outer, SAFETY_INFO) if !frame.encrypted && (outer == 0 || outer == 0x14) => {
                     let info = br#"{"aesIvType":"2","aesKeyType":"1","authAlgorithmType":"4","authKeyType":"1","integrityType":"1","result":"0"}"#;
-                    write_frame(&mut self.stream, 0, SAFETY_INFO_ACK, frame.sequence, info).await?;
+                    let response = if outer == 0x14 {
+                        wrap("ack", info)?
+                    } else {
+                        info.to_vec()
+                    };
+                    write_frame(
+                        &mut self.stream,
+                        outer,
+                        SAFETY_INFO_ACK,
+                        frame.sequence,
+                        &response,
+                    )
+                    .await?;
                     let payload = wrap(
                         "cmd",
                         format!(r#"{{"authMsg":"{own_challenge}"}}"#).as_bytes(),
@@ -454,7 +466,7 @@ impl MiPlaySession {
                     let encrypted = cipher.encrypt(&payload)?;
                     write_frame(&mut self.stream, 0x14, SAFETY_AUTH, 0, &encrypted).await?;
                 }
-                (0, SAFETY_AUTH) => {
+                (outer, SAFETY_AUTH) if outer == 0 || outer == 0x14 => {
                     let value = serde_json::from_slice::<Value>(&unwrap(&frame.body)?)
                         .map_err(|_| ProtocolError::InvalidJson)?;
                     let peer_challenge = value
@@ -465,7 +477,7 @@ impl MiPlaySession {
                     let response = format!(r#"{{"authMsgAck":"{ack}","result":"0"}}"#);
                     pending_auth = Some((frame.sequence, response.into_bytes()));
                 }
-                (0, SAFETY_AUTH_ACK) => {
+                (outer, SAFETY_AUTH_ACK) if outer == 0 || outer == 0x14 => {
                     let value = serde_json::from_slice::<Value>(&unwrap(&frame.body)?)
                         .map_err(|_| ProtocolError::InvalidJson)?;
                     let received = value
@@ -480,7 +492,7 @@ impl MiPlaySession {
                         let encrypted = cipher.encrypt(&wrapped)?;
                         write_frame(
                             &mut self.stream,
-                            0x14,
+                            outer,
                             SAFETY_AUTH_ACK,
                             sequence,
                             &encrypted,
