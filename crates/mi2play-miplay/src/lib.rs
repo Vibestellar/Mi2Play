@@ -353,7 +353,8 @@ impl MiPlaySession {
         tracing::info!(peer = %self.peer_addr(), "MiPlay session started");
         let local = self.stream.local_addr()?;
         let key = auth_key(local, self.peer);
-        let mut cipher = Cipher::new(key);
+        let mut read_cipher = Cipher::new(key);
+        let mut write_cipher = Cipher::new(key);
         let mut own_challenge = [0; 16];
         rand::thread_rng().fill_bytes(&mut own_challenge);
         let own_challenge = hex::encode(own_challenge);
@@ -369,7 +370,7 @@ impl MiPlaySession {
         .await?;
         tracing::info!("MiPlay device identity announced");
         loop {
-            let frame = match read_frame(&mut self.stream, &mut cipher).await {
+            let frame = match read_frame(&mut self.stream, &mut read_cipher).await {
                 Ok(frame) => frame,
                 Err(ProtocolError::Io(error))
                     if error.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -463,7 +464,7 @@ impl MiPlaySession {
                         "cmd",
                         format!(r#"{{"authMsg":"{own_challenge}"}}"#).as_bytes(),
                     )?;
-                    let encrypted = cipher.encrypt(&payload)?;
+                    let encrypted = write_cipher.encrypt(&payload)?;
                     write_frame(&mut self.stream, 0x14, SAFETY_AUTH, 0, &encrypted).await?;
                 }
                 (outer, SAFETY_AUTH) if outer == 0 || outer == 0x14 => {
@@ -489,7 +490,7 @@ impl MiPlaySession {
                     }
                     if let Some((sequence, response)) = pending_auth.take() {
                         let wrapped = wrap("ack", &response)?;
-                        let encrypted = cipher.encrypt(&wrapped)?;
+                        let encrypted = write_cipher.encrypt(&wrapped)?;
                         write_frame(
                             &mut self.stream,
                             outer,
@@ -505,7 +506,7 @@ impl MiPlaySession {
                         r#"{{"deviceId":"{}","deviceName":"{}","model":"{}","deviceType":2}}"#,
                         self.identity.id, self.identity.name, self.identity.model
                     );
-                    let encrypted = cipher.encrypt(body.as_bytes())?;
+                    let encrypted = write_cipher.encrypt(body.as_bytes())?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -516,7 +517,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, SET_DEVICE_INFO) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -527,7 +528,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, GET_MIRROR_MODE) => {
-                    let encrypted = cipher.encrypt(&[0, 0, 0, 0, 1])?;
+                    let encrypted = write_cipher.encrypt(&[0, 0, 0, 0, 1])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -541,7 +542,7 @@ impl MiPlaySession {
                     if let Ok(value) = serde_json::from_slice::<Value>(&unwrap(&frame.body)?) {
                         stream_keys = parse_stream_keys(&value);
                     }
-                    let encrypted = cipher.encrypt(&[0])?;
+                    let encrypted = write_cipher.encrypt(&[0])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -552,7 +553,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, GET_VOLUME) => {
-                    let encrypted = cipher.encrypt(&[50])?;
+                    let encrypted = write_cipher.encrypt(&[50])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -563,7 +564,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, HEARTBEAT) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -574,7 +575,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, GET_STATE) => {
-                    let encrypted = cipher.encrypt(&[0, 0, 0, 0, 0])?;
+                    let encrypted = write_cipher.encrypt(&[0, 0, 0, 0, 0])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -585,7 +586,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, SET_PLAY_SOURCE) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -607,20 +608,20 @@ impl MiPlaySession {
                             tracing::warn!(%error, "MiPlay RTSP media session failed");
                         }
                     });
-                    let encrypted = cipher.encrypt(&[0, 0, 0, 0, 0])?;
+                    let encrypted = write_cipher.encrypt(&[0, 0, 0, 0, 0])?;
                     write_frame(&mut self.stream, 0, OPEN_ACK, frame.sequence, &encrypted).await?;
                 }
                 (0, PAUSE) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(&mut self.stream, 0, PAUSE_ACK, frame.sequence, &encrypted).await?;
                 }
                 (0, RESUME) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(&mut self.stream, 0, RESUME_ACK, frame.sequence, &encrypted)
                         .await?;
                 }
                 (0, SET_VOLUME) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -632,7 +633,7 @@ impl MiPlaySession {
                 }
                 (0, SET_MEDIA_INFO) | (0, GET_MEDIA_INFO) => {
                     if frame.command == SET_MEDIA_INFO {
-                        let encrypted = cipher.encrypt(&[])?;
+                        let encrypted = write_cipher.encrypt(&[])?;
                         write_frame(
                             &mut self.stream,
                             0,
@@ -642,12 +643,12 @@ impl MiPlaySession {
                         )
                         .await?;
                     } else {
-                        let notification = cipher.encrypt(&empty_media_info_notification())?;
+                        let notification = write_cipher.encrypt(&empty_media_info_notification())?;
                         write_frame(&mut self.stream, 0, NOTIFY, 8, &notification).await?;
                     }
                 }
                 (0, SET_POSITION) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -658,7 +659,7 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, SET_MEDIA_STATE) => {
-                    let encrypted = cipher.encrypt(&[])?;
+                    let encrypted = write_cipher.encrypt(&[])?;
                     write_frame(
                         &mut self.stream,
                         0,
