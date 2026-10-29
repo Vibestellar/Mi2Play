@@ -152,14 +152,13 @@ impl Cipher {
         let padding = 16 - (plain.len() % 16);
         let mut data = plain.to_vec();
         data.resize(data.len() + padding, 0);
-        let next_iv = data[data.len() - 16..].try_into().unwrap_or([0; 16]);
         let encryptor = AesCbc::new_from_slices(&self.key, &self.iv)
             .map_err(|_| ProtocolError::InvalidEncryptedBody)?;
         let data_len = data.len();
         encryptor
             .encrypt_padded_mut::<NoPadding>(&mut data, data_len)
             .map_err(|_| ProtocolError::InvalidEncryptedBody)?;
-        self.iv = next_iv;
+        self.iv = data[data.len() - 16..].try_into().unwrap_or([0; 16]);
         let mut result = vec![0, 7, 1, 0xe0, padding as u8];
         result.extend_from_slice(&integrity(&data).to_be_bytes());
         result.extend_from_slice(&data);
@@ -1086,5 +1085,19 @@ mod tests {
             parse_wfd_url("wfd://192.0.2.2:7236?x=1").unwrap(),
             ("192.0.2.2".into(), 7236)
         );
+    }
+
+    #[test]
+    fn control_cipher_preserves_cbc_state_across_frames() {
+        let key = [0x42; 16];
+        let mut writer = Cipher::new(key);
+        let mut reader = Cipher::new(key);
+        for payload in [
+            b"first frame".as_slice(),
+            b"second frame with more data".as_slice(),
+        ] {
+            let encrypted = writer.encrypt(payload).unwrap();
+            assert_eq!(reader.decrypt(&encrypted).unwrap(), payload);
+        }
     }
 }
