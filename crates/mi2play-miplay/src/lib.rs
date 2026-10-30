@@ -502,11 +502,8 @@ impl MiPlaySession {
                     }
                 }
                 (0, GET_DEVICE_INFO) => {
-                    let body = format!(
-                        r#"{{"deviceId":"{}","deviceName":"{}","model":"{}","deviceType":2}}"#,
-                        self.identity.id, self.identity.name, self.identity.model
-                    );
-                    let encrypted = write_cipher.encrypt(body.as_bytes())?;
+                    let body = build_device_info(&self.identity);
+                    let encrypted = write_cipher.encrypt(&body)?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -724,6 +721,49 @@ fn empty_media_info_notification() -> Vec<u8> {
         0x0b, b'm', b'e', b'd', b'i', b'a', b'I', b'n', b'f', b'o', b'E', b'x', 0x16, 0x00, 0x00,
         0x00, 0x0c, 0x06, b'm', b'T', b'i', b't', b'l', b'e', 0x14, 0x00, 0x00, 0x00, 0x00,
     ]
+}
+
+fn build_device_info(identity: &DeviceIdentity) -> Vec<u8> {
+    let device_id = short_device_id(&identity.id);
+    let entries = [
+        ("alonePlayCapacity", "0"),
+        ("canAlonePlayCtrl", "0"),
+        ("canHeadsetCtrl", "0"),
+        ("canRevCtrl", "1"),
+        ("channel", ""),
+        ("deviceId", device_id.as_str()),
+        ("deviceType", "2"),
+        ("model", identity.model.as_str()),
+        ("needAblum", "1"),
+        ("needLrc", "1"),
+        ("needPos", "1"),
+        ("romVersion", ""),
+        ("support", "audio"),
+    ];
+    let mut body = vec![0x00, 0x01, 0x55];
+    for (key, value) in entries {
+        body.push(key.len() as u8);
+        body.extend_from_slice(key.as_bytes());
+        body.push(0x0c);
+        body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        body.extend_from_slice(value.as_bytes());
+    }
+    body
+}
+
+fn short_device_id(device_id: &str) -> String {
+    if device_id.len() == 3 && device_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return device_id.to_owned();
+    }
+    let hex_digits: String = device_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if hex_digits.len() >= 8 {
+        return hex_digits[hex_digits.len() - 8..].to_owned();
+    }
+    hex::encode_upper(&Md5::digest(device_id.as_bytes())[..4])
 }
 
 fn parse_wfd_url(value: &str) -> Result<(String, u16), ProtocolError> {
@@ -1130,6 +1170,28 @@ mod tests {
                 "b3a2a88a2e767964fef89395ca9b65c7"
             ))
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn device_info_matches_fusionplay_wire_shape() {
+        let body = build_device_info(&DeviceIdentity {
+            id: "A0-36-BC-25-05-43".into(),
+            name: "Mi2Play".into(),
+            model: "Mi2Play".into(),
+        });
+        assert_eq!(&body[..3], &[0, 1, 0x55]);
+        assert!(
+            body.windows(b"deviceId\x0c\x00\x08BC250543".len())
+                .any(|window| window == b"deviceId\x0c\x00\x08BC250543")
+        );
+        assert!(
+            body.windows(b"deviceType\x0c\x00\x012".len())
+                .any(|window| window == b"deviceType\x0c\x00\x012")
+        );
+        assert!(
+            body.windows(b"support\x0c\x00\x05audio".len())
+                .any(|window| window == b"support\x0c\x00\x05audio")
         );
     }
 }
