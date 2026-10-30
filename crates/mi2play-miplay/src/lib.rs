@@ -205,7 +205,7 @@ fn integrity(bytes: &[u8]) -> u32 {
     value
 }
 
-fn auth_key(local: SocketAddr, remote: SocketAddr) -> [u8; 16] {
+fn auth_key(local: SocketAddr, remote: SocketAddr) -> String {
     let value = format!(
         "{}{}{}{}",
         local.ip(),
@@ -223,8 +223,7 @@ fn auth_key(local: SocketAddr, remote: SocketAddr) -> [u8; 16] {
             }
         })
         .collect();
-    let digest = Md5::digest(mapped.as_bytes());
-    digest[..16].try_into().unwrap()
+    hex::encode(Md5::digest(mapped.as_bytes()))
 }
 
 fn hmac_hex(key: &[u8], value: &str) -> String {
@@ -351,9 +350,11 @@ impl MiPlaySession {
     pub async fn run(mut self, events: mpsc::Sender<SessionEvent>) -> Result<(), ProtocolError> {
         tracing::info!(peer = %self.peer_addr(), "MiPlay session started");
         let local = self.stream.local_addr()?;
-        let key = auth_key(local, self.peer);
-        let mut read_cipher = Cipher::new(key);
-        let mut write_cipher = Cipher::new(key);
+        let auth_key = auth_key(local, self.peer);
+        let mut cipher_key = [0; 16];
+        cipher_key.copy_from_slice(&auth_key.as_bytes()[..16]);
+        let mut read_cipher = Cipher::new(cipher_key);
+        let mut write_cipher = Cipher::new(cipher_key);
         let mut own_challenge = [0; 16];
         rand::thread_rng().fill_bytes(&mut own_challenge);
         let own_challenge = hex::encode(own_challenge);
@@ -473,7 +474,7 @@ impl MiPlaySession {
                         .get("authMsg")
                         .and_then(Value::as_str)
                         .ok_or(ProtocolError::InvalidJson)?;
-                    let ack = hmac_hex(&key, peer_challenge);
+                    let ack = hmac_hex(auth_key.as_bytes(), peer_challenge);
                     let response = format!(r#"{{"authMsgAck":"{ack}","result":"0"}}"#);
                     pending_auth = Some((frame.sequence, response.into_bytes()));
                 }
@@ -484,7 +485,7 @@ impl MiPlaySession {
                         .get("authMsgAck")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if received != hmac_hex(&key, &own_challenge) {
+                    if received != hmac_hex(auth_key.as_bytes(), &own_challenge) {
                         return Err(ProtocolError::InvalidJson);
                     }
                     if let Some((sequence, response)) = pending_auth.take() {
@@ -1076,7 +1077,18 @@ mod tests {
             "192.0.2.1:8899".parse().unwrap(),
             "192.0.2.2:4000".parse().unwrap(),
         );
-        assert_eq!(key.len(), 16);
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn auth_key_matches_fusionplay_reference() {
+        assert_eq!(
+            auth_key(
+                "192.168.31.128:8899".parse().unwrap(),
+                "192.168.31.207:49668".parse().unwrap(),
+            ),
+            "b0175093fe7e51f8ac3cdeb42cd9f513"
+        );
     }
 
     #[test]
@@ -1099,5 +1111,25 @@ mod tests {
             let encrypted = writer.encrypt(payload).unwrap();
             assert_eq!(reader.decrypt(&encrypted).unwrap(), payload);
         }
+    }
+
+    #[test]
+    fn encrypted_auth_matches_fusionplay_capture() {
+        let mut cipher = Cipher::new(*b"b0175093fe7e51f8");
+        let payload = b"{\n\t\"authMsg\": \"a36d6fd57705e13323c23db0e8a5347c\" \n} \n";
+        let encrypted = cipher.encrypt(&wrap("cmd", payload).unwrap()).unwrap();
+        assert_eq!(
+            &encrypted[..9],
+            &[0x00, 0x07, 0x01, 0xe0, 0x02, 0x98, 0xa7, 0xb4, 0xd3]
+        );
+        assert_eq!(
+            &encrypted[9..],
+            hex::decode(concat!(
+                "35105d15b265cb733b043fca060ebd32bc490d86f63d3f00",
+                "0e225b893c09e9c12af0f54fb686032a931ea9a2c8d09420",
+                "b3a2a88a2e767964fef89395ca9b65c7"
+            ))
+            .unwrap()
+        );
     }
 }
