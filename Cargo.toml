@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/mi2play-core",
+    "crates/mi2play-airplay",
     "crates/mi2play-miplay",
     "crates/mi2play-cli",
 ]
@@ -12,11 +13,27 @@ rust-version = "1.85"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+aes = "0.8"
+base64 = "0.22"
+alac-encoder = "0.3"
+cbc = { version = "0.1", features = ["alloc"] }
+hex = "0.4"
+hmac = "0.12"
+md-5 = "0.10"
 mi2play-core = { path = "crates/mi2play-core" }
+mi2play-airplay = { path = "crates/mi2play-airplay" }
 mi2play-miplay = { path = "crates/mi2play-miplay" }
+rand = "0.8"
+rsa = { version = "0.9", features = ["sha1"] }
+sha1 = "0.10"
+mdns-sd = "0.21"
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+symphonia = { version = "0.5", features = ["aac"] }
 thiserror = "2.0"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1.44", features = ["io-std", "io-util", "net", "rt-multi-thread", "macros", "sync", "time"] }

@@ -1,8 +1,19 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, ValueEnum};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
+use mi2play_airplay::{PcmAudioFrame, PcmToRaop, RaopClient, RaopEndpoint, discover_raop};
 use mi2play_core::DeviceRegistry;
+use mi2play_miplay::{MiPlayServer, SessionEvent};
 use serde::Deserialize;
-use std::{fs, path::PathBuf};
+use sha2::{Digest, Sha256};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, net::SocketAddr, path::PathBuf};
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, stdin};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
@@ -36,7 +47,7 @@ impl LogLevel {
 struct Args {
     #[arg(long, env = "MI2PLAY_CONFIG")]
     config: Option<PathBuf>,
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "0.0.0.0:8899")]
     listen: String,
     #[arg(long, default_value = "Mi2Play")]
     name: String,
@@ -44,6 +55,16 @@ struct Args {
     player_filter: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     player_addresses: Vec<String>,
+    #[arg(long, help = "RAOP RTSP address, for example 192.168.1.20:7000")]
+    raop_address: Option<SocketAddr>,
+    #[arg(long, env = "MI2PLAY_RAOP_PASSWORD")]
+    raop_password: Option<String>,
+    #[arg(long, default_value_t = 48_000)]
+    audio_sample_rate: u32,
+    #[arg(long, default_value_t = 2)]
+    audio_channels: u8,
+    #[arg(long, help = "read interleaved little-endian 16-bit PCM from stdin")]
+    pcm_stdin: bool,
     #[arg(long, default_value_t = 0)]
     device_count: usize,
     #[arg(long, default_value_t = true)]
@@ -68,6 +89,11 @@ struct FileConfig {
     name: Option<String>,
     player_filter: Option<Vec<String>>,
     player_addresses: Option<Vec<String>>,
+    raop_address: Option<SocketAddr>,
+    raop_password: Option<String>,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<u8>,
+    pcm_stdin: Option<bool>,
     device_count: Option<usize>,
     foreground: Option<bool>,
     low_latency: Option<bool>,
@@ -132,16 +158,65 @@ fn validate(args: &Args, file: &FileConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let file = load_file(args.config.as_ref())?;
     validate(&args, &file)?;
     let level = file.log_level.unwrap_or(args.log_level);
+    let default_filter = format!(
+        "mi2play={},mi2play_miplay={},mi2play_airplay={}",
+        level.as_str(),
+        level.as_str(),
+        level.as_str()
+    );
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(level.as_str()))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
+        )
         .init();
 
     let _registry = DeviceRegistry::default();
+    let configured_raop = file.raop_address.or(args.raop_address);
+    let raop_password = file.raop_password.or(args.raop_password);
+    let sample_rate = file.audio_sample_rate.unwrap_or(args.audio_sample_rate);
+    let channels = file.audio_channels.unwrap_or(args.audio_channels);
+    let pcm_stdin = file.pcm_stdin.unwrap_or(args.pcm_stdin);
+    let listen = file
+        .listen
+        .as_deref()
+        .unwrap_or(&args.listen)
+        .parse::<SocketAddr>()?;
+    let _mdns = advertise_miplay(
+        file.name.as_deref().unwrap_or(&args.name),
+        listen,
+        file.ipv6.unwrap_or(args.ipv6),
+    )?;
+    let _mi_connect_probe = spawn_mi_connect_probe_listener(file.ipv6.unwrap_or(args.ipv6)).await?;
+    let player_filter = file.player_filter.as_ref().unwrap_or(&args.player_filter);
+    let raop_address = if configured_raop.is_some() {
+        configured_raop
+    } else {
+        let discovered =
+            tokio::task::spawn_blocking(|| discover_raop(std::time::Duration::from_secs(3)))
+                .await??;
+        discovered
+            .into_iter()
+            .find(|endpoint| {
+                player_filter.is_empty()
+                    || player_filter
+                        .iter()
+                        .any(|filter| endpoint.name.contains(filter))
+            })
+            .map(|endpoint| {
+                tracing::info!(
+                    name = %endpoint.name,
+                    address = %endpoint.address,
+                    "AirPlay 1 receiver discovered"
+                );
+                endpoint.address
+            })
+    };
     tracing::info!(
         listen = %file.listen.as_deref().unwrap_or(&args.listen),
         name = %file.name.as_deref().unwrap_or(&args.name),
@@ -152,7 +227,384 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         foreground = file.foreground.unwrap_or(args.foreground),
         ipv4 = file.ipv4.unwrap_or(args.ipv4),
         ipv6 = file.ipv6.unwrap_or(args.ipv6),
-        "mi2play protocol core initialized; network discovery/output are not enabled yet"
+        raop_address = ?raop_address,
+        sample_rate,
+        channels,
+        "mi2play protocol core initialized"
     );
+    if pcm_stdin {
+        let address = raop_address.ok_or("`--pcm-stdin` requires `--raop-address`")?;
+        let endpoint = RaopEndpoint {
+            address,
+            name: "configured-player".into(),
+        };
+        let mut client = RaopClient::connect_with_password(
+            &endpoint,
+            sample_rate,
+            channels,
+            raop_password.as_deref(),
+        )
+        .await?;
+        let mut bridge = PcmToRaop::new(sample_rate, channels)?;
+        let bytes_per_frame = channels as usize * 2;
+        let mut input = stdin();
+        let mut buffer = vec![0; 16 * 1024];
+        let mut pending = Vec::new();
+        let mut sequence = 0u16;
+        let mut timestamp = 0u32;
+        loop {
+            let read = input.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buffer[..read]);
+            let aligned = pending.len() / bytes_per_frame * bytes_per_frame;
+            if aligned == 0 {
+                continue;
+            }
+            let pcm = pending.drain(..aligned).collect::<Vec<_>>();
+            client
+                .send_pcm(
+                    &mut bridge,
+                    PcmAudioFrame {
+                        sequence,
+                        timestamp,
+                        sample_rate,
+                        channels,
+                        pcm,
+                    },
+                )
+                .await?;
+            sequence = sequence.wrapping_add(1);
+            timestamp = timestamp.wrapping_add((aligned / bytes_per_frame) as u32);
+        }
+        if !pending.is_empty() {
+            return Err("stdin PCM ended with a partial sample".into());
+        }
+        client.stop().await?;
+    } else if let Some(address) = raop_address {
+        let server = MiPlayServer::bind(listen).await?;
+        tracing::info!(address = %server.local_addr()?, "MiPlay session listener started");
+        loop {
+            let session = server.accept().await?;
+            let endpoint = RaopEndpoint {
+                address,
+                name: "configured-player".into(),
+            };
+            let password = raop_password.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    bridge_session(session, endpoint, sample_rate, channels, password).await
+                {
+                    tracing::warn!(%error, "MiPlay-to-RAOP session failed");
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+fn advertise_miplay(
+    name: &str,
+    listen: SocketAddr,
+    ipv6: bool,
+) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    listen.ip().hash(&mut hasher);
+    let id = format!("{:016x}", hasher.finish());
+    let hostname = format!("mi2play-{id}.local.");
+    let lyra_instance = id[id.len() - 8..].to_ascii_uppercase();
+    let mi_connect_instance = format!("{}({})", sanitize_dns_label(name), &id[..10]);
+    let device_id = device_uuid(&id);
+    let digest = Sha256::digest(device_id.as_bytes());
+    let id_hash = BASE64.encode(&digest[..3]);
+    let apps_data = build_apps_data(listen.port(), &device_id);
+    let mi_connect_properties = [
+        ("version", "196608"),
+        ("apps", "[5]"),
+        ("flags", "CgE="),
+        ("name", name),
+        ("idHash", id_hash.as_str()),
+        ("dev", "4"),
+        ("sec", "2"),
+        ("appsData", apps_data.as_str()),
+        ("commonData", "0"),
+    ];
+    let advertised_ip = advertised_ipv4(listen);
+    let lyra_app_data = build_lyra_app_data(name, &lyra_instance, listen);
+    let debug_info = format!("{{msg:reply, ifname:unknown, v4:{advertised_ip}}}");
+    let timestamp = unix_millis().to_string();
+    let lyra_properties = [
+        ("AppData", lyra_app_data.as_str()),
+        ("MediumType", "8192"),
+        ("CH", "0"),
+        ("DebugInfo", debug_info.as_str()),
+        ("TS", timestamp.as_str()),
+    ];
+    let daemon = ServiceDaemon::new()?;
+    if !ipv6 {
+        daemon.disable_interface(mdns_sd::IfKind::IPv6)?;
+    }
+    for (service_type, service_name, port) in [
+        ("_lyra-mdns._udp.local.", lyra_instance.as_str(), 5353),
+        (
+            "_mi-connect._udp.local.",
+            mi_connect_instance.as_str(),
+            56666,
+        ),
+    ] {
+        let service_properties = if service_type.starts_with("_lyra") {
+            &lyra_properties[..]
+        } else {
+            &mi_connect_properties[..]
+        };
+        let service = ServiceInfo::new(
+            service_type,
+            service_name,
+            &hostname,
+            "",
+            port,
+            service_properties,
+        )?
+        .enable_addr_auto();
+        daemon.register(service)?;
+    }
+    tracing::info!(
+        lyra_instance,
+        mi_connect_instance,
+        hostname,
+        advertised_ip = %advertised_ip,
+        control_port = listen.port(),
+        discovery_port = 56666,
+        "MiPlay mDNS services advertised"
+    );
+    Ok(daemon)
+}
+
+async fn spawn_mi_connect_probe_listener(
+    ipv6: bool,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, std::io::Error> {
+    let mut listeners = Vec::new();
+    let socket = UdpSocket::bind(("0.0.0.0", 56666)).await?;
+    tracing::info!(address = %socket.local_addr()?, "MiPlay discovery UDP listener started");
+    listeners.push(tokio::spawn(async move {
+        let mut buffer = [0u8; 2048];
+        loop {
+            match socket.recv_from(&mut buffer).await {
+                Ok((length, peer)) => {
+                    tracing::debug!(%peer, bytes = length, "MiPlay discovery UDP probe received");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "MiPlay discovery UDP listener stopped");
+                    break;
+                }
+            }
+        }
+    }));
+    if ipv6 {
+        let socket = UdpSocket::bind(("[::]", 56666)).await?;
+        tracing::info!(address = %socket.local_addr()?, "MiPlay IPv6 discovery UDP listener started");
+        listeners.push(tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            loop {
+                match socket.recv_from(&mut buffer).await {
+                    Ok((length, peer)) => {
+                        tracing::debug!(%peer, bytes = length, "MiPlay IPv6 discovery UDP probe received");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "MiPlay IPv6 discovery UDP listener stopped");
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    Ok(listeners)
+}
+
+fn sanitize_dns_label(value: &str) -> String {
+    let mut label: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if label.is_empty() {
+        label.push_str("Mi2Play");
+    }
+    label.truncate(45);
+    label.trim_matches('-').to_owned()
+}
+
+fn build_apps_data(control_port: u16, device_id: &str) -> String {
+    let mut payload = vec![0u8; 25];
+    payload[0..2].copy_from_slice(&1155u16.to_be_bytes());
+    payload[2..4].copy_from_slice(&control_port.to_be_bytes());
+    let digest = Sha256::digest(device_id.as_bytes());
+    payload[4] = (digest[0] & 0xfc) | 2;
+    payload[5..10].copy_from_slice(&digest[1..6]);
+    let identity = format!(r#"{{"mico":{{"device_id":"{}"}}}}"#, device_id);
+    payload.extend_from_slice(identity.as_bytes());
+    let mut container = vec![0x81, 0x00, payload.len() as u8];
+    container.extend_from_slice(&payload);
+    BASE64.encode(container)
+}
+
+fn device_uuid(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:02x}{:02x}-\
+         {:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        digest[4],
+        digest[5],
+        digest[6] & 0x0f,
+        digest[7],
+        (digest[8] & 0x3f) | 0x80,
+        digest[9],
+        digest[10],
+        digest[11],
+        digest[12],
+        digest[13],
+        digest[14],
+        digest[15]
+    )
+}
+
+fn build_lyra_app_data(name: &str, instance: &str, listen: SocketAddr) -> String {
+    let mut payload = vec![0x00, 0x40, 0x03];
+    let instance_bytes = u32::from_str_radix(instance, 16)
+        .unwrap_or_default()
+        .to_be_bytes();
+    payload.extend_from_slice(&instance_bytes);
+    payload.extend_from_slice(&[
+        0x00, 0x05, 0x19, 0x24, 0x10, 0x01, 0x03, 0x0a, 0x03, 0x01, 0xda, 0xae, 0x01, 0x01, 0x80,
+        0x02,
+    ]);
+    let name = name.as_bytes();
+    let length = name.len().min(63);
+    payload.push(length as u8);
+    payload.extend_from_slice(&name[..length]);
+    payload.extend_from_slice(&[0x25, 0x01, 0x03]);
+    let _ = listen;
+    BASE64.encode(payload)
+}
+
+fn advertised_ipv4(listen: SocketAddr) -> std::net::Ipv4Addr {
+    if let SocketAddr::V4(address) = listen {
+        if !address.ip().is_unspecified() {
+            return *address.ip();
+        }
+    }
+    let Ok(socket) = std::net::UdpSocket::bind(("0.0.0.0", 0)) else {
+        return std::net::Ipv4Addr::UNSPECIFIED;
+    };
+    if socket.connect(("192.168.1.1", 9)).is_ok() {
+        if let Ok(SocketAddr::V4(address)) = socket.local_addr() {
+            return *address.ip();
+        }
+    }
+    std::net::Ipv4Addr::UNSPECIFIED
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+async fn bridge_session(
+    session: mi2play_miplay::MiPlaySession,
+    endpoint: RaopEndpoint,
+    sample_rate: u32,
+    channels: u8,
+    password: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peer = session.peer_addr();
+    let (events_tx, mut events_rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        if let Err(error) = session.run(events_tx).await {
+            tracing::debug!(%error, %peer, "MiPlay connection closed");
+        }
+    });
+    let mut client = None;
+    let mut bridge = None;
+    while let Some(event) = events_rx.recv().await {
+        match event {
+            SessionEvent::Audio(frame) => {
+                if client.is_none() {
+                    tracing::info!(
+                        endpoint = %endpoint.address,
+                        "MiPlay audio received; connecting to RAOP receiver"
+                    );
+                    client = Some(
+                        RaopClient::connect_with_password(
+                            &endpoint,
+                            sample_rate,
+                            channels,
+                            password.as_deref(),
+                        )
+                        .await?,
+                    );
+                    bridge = Some(PcmToRaop::new(sample_rate, channels)?);
+                }
+                tracing::trace!(
+                    sequence = frame.sequence,
+                    timestamp = frame.timestamp,
+                    pcm_bytes = frame.pcm.len(),
+                    "Bridging MiPlay PCM to RAOP"
+                );
+                client
+                    .as_mut()
+                    .expect("RAOP client initialized for audio")
+                    .send_pcm(
+                        bridge.as_mut().expect("PCM bridge initialized for audio"),
+                        PcmAudioFrame {
+                            sequence: frame.sequence,
+                            timestamp: frame.timestamp,
+                            sample_rate: frame.sample_rate,
+                            channels: frame.channels,
+                            pcm: frame.pcm,
+                        },
+                    )
+                    .await?;
+            }
+            SessionEvent::Command { command, payload } => match command & 0xff {
+                0x04 => {
+                    if let Some(client) = client.as_mut() {
+                        client.pause().await?;
+                    }
+                }
+                0x06 => {
+                    if let Some(client) = client.as_mut() {
+                        client.resume().await?;
+                    }
+                }
+                0x0c => {
+                    if let Some(&volume) = payload.first() {
+                        tracing::debug!(volume, "Applying MiPlay volume to RAOP");
+                        if let Some(client) = client.as_mut() {
+                            client.set_volume(RaopClient::volume_db(volume)).await?;
+                        }
+                    }
+                }
+                0x08 => break,
+                _ => {}
+            },
+            SessionEvent::Disconnected => break,
+        }
+    }
+    if let Some(client) = client {
+        client.stop().await?;
+    }
     Ok(())
 }
