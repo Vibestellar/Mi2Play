@@ -793,18 +793,30 @@ async fn receive_rtsp(
     let mut control = TcpStream::connect(&address).await?;
     let mut input = Vec::new();
     let mut data: Option<TcpStream> = None;
+    let mut data_ports: Option<(u16, u16)> = None;
     let mut sent_options = false;
     loop {
         let message = read_rtsp(&mut control, &mut input).await?;
         let cseq = header(&message, "cseq").unwrap_or("0").to_string();
         if message.starts_with("OPTIONS") {
             let response = format!(
-                "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nPublic: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER\r\n\r\n"
+                "RTSP/1.0 200 OK\r\n\
+                 User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                 CSeq: {cseq}\r\n\
+                 Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER\r\n\r\n"
             );
             control.write_all(response.as_bytes()).await?;
             if !sent_options {
                 sent_options = true;
-                control.write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nRequire: org.wfa.wfd1.0\r\nlib_version: audio-display-release2.1 2.1.5071614\r\n\r\n").await?;
+                control
+                    .write_all(
+                        b"OPTIONS * RTSP/1.0\r\n\
+                      User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                      CSeq: 1\r\n\
+                      Require: org.wfa.wfd1.0\r\n\
+                      lib_version: audio-display-release2.1 2.1.5071614\r\n\r\n",
+                    )
+                    .await?;
             }
         } else if message.starts_with("GET_PARAMETER") {
             if message.contains("wfd_audio_codecs_v2") && data.is_none() {
@@ -818,35 +830,85 @@ async fn receive_rtsp(
                     while image.read(&mut buffer).await.unwrap_or(0) > 0 {}
                 });
                 data = Some(audio);
-                let body = "wfd_audio_codecs_v2: 15 3 3\r\nwfd_video_formats: none\r\nwfd_client_rtp_ports: RTP/AVP/TCP;interleaved mode=play\r\n";
+                data_ports = Some((image_port, audio_port));
+                let body = concat!(
+                    "wfd_audio_codecs_v2: 15 3 3\r\n",
+                    "wfd_video_formats: none\r\n",
+                    "wfd_video_enctype: none\r\n",
+                    "wfd_video_gamuttype: none\r\n",
+                    "wfd_video_bitrate: none\r\n",
+                    "wfd_current_video_info: none\r\n",
+                    "wfd_client_rtp_ports: RTP/AVP/TCP;interleaved mode=play\r\n",
+                    "miplay_support_image: none\r\n",
+                    "wfd_standby_resume_capability: supported\r\n",
+                    "wfd_content_SP_protection: 4 1 256 3 1 1 0 0\r\n",
+                    "wfd_support_secure_win:enable\r\n",
+                    "device_info: -1 -1 -1 -1 -1 -1 -1\r\n",
+                );
                 control
                     .write_all(
                         format!(
-                            "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: {}\r\n\r\n{body}",
+                            "RTSP/1.0 200 OK\r\n\
+                             User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                             CSeq: {cseq}\r\n\
+                             Content-Type: text/parameters\r\n\
+                             Content-Length: {}\r\n\r\n{body}",
                             body.len()
                         )
                         .as_bytes(),
                     )
                     .await?;
-                let setup = format!(
-                    "SETUP rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;interleaved=0-1\r\nMultiPort: image_port={image_port};multi_port={audio_port}\r\n\r\n"
-                );
-                control.write_all(setup.as_bytes()).await?;
             } else {
                 control
-                    .write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n").as_bytes())
+                    .write_all(
+                        format!(
+                            "RTSP/1.0 200 OK\r\n\
+                             User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                             CSeq: {cseq}\r\n\
+                             Content-Length: 0\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
                     .await?;
             }
         } else if message.starts_with("SET_PARAMETER") {
             control
-                .write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n").as_bytes())
+                .write_all(
+                    format!(
+                        "RTSP/1.0 200 OK\r\n\
+                         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                         CSeq: {cseq}\r\n\
+                         Content-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
                 .await?;
             if message.contains("wfd_trigger_method: SETUP") {
-                control.write_all(format!("SETUP rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\nCSeq: 2\r\nTransport: RTP/AVP/TCP;interleaved=0-1\r\n\r\n").as_bytes()).await?;
+                let (image_port, audio_port) = data_ports.ok_or(ProtocolError::InvalidRtsp)?;
+                control
+                    .write_all(
+                        format!(
+                            "SETUP rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\n\
+                             User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                             CSeq: 2\r\n\
+                             Transport: RTP/AVP/TCP;interleaved=0-1\r\n\
+                             MultiPort: image_port={image_port};multi_port={audio_port}\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
             }
         } else if message.starts_with("PLAY") {
             control
-                .write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n").as_bytes())
+                .write_all(
+                    format!(
+                        "RTSP/1.0 200 OK\r\n\
+                         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                         CSeq: {cseq}\r\n\
+                         Content-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
                 .await?;
             if let Some(audio) = data.take() {
                 receive_rtp(audio, keys, events).await?;
@@ -854,10 +916,28 @@ async fn receive_rtsp(
             }
         } else if message.starts_with("PAUSE") {
             control
-                .write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n").as_bytes())
+                .write_all(
+                    format!(
+                        "RTSP/1.0 200 OK\r\n\
+                         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                         CSeq: {cseq}\r\n\
+                         Content-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
                 .await?;
         } else if message.starts_with("RTSP/1.0") && message.contains("CSeq: 2") {
-            control.write_all(format!("PLAY rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\nCSeq: 3\r\nSession: 1\r\n\r\n").as_bytes()).await?;
+            control
+                .write_all(
+                    format!(
+                        "PLAY rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\n\
+                         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                         CSeq: 3\r\n\
+                         Session: 1\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await?;
         }
     }
 }
