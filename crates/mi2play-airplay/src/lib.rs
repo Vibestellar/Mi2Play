@@ -282,30 +282,9 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
 a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
             client.session, local_ip_text, local_ip_text, channels, sample_rate, key, iv
         );
-        let mut challenge_bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut challenge_bytes);
-        let challenge = STANDARD
-            .encode(challenge_bytes)
-            .trim_end_matches('=')
-            .to_owned();
-        let announce_response = client
-            .request(
-                "ANNOUNCE",
-                &sdp,
-                &[
-                    ("Content-Type", "application/sdp"),
-                    ("Apple-Challenge", &challenge),
-                ],
-            )
+        client
+            .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
             .await?;
-        if let Some(response) = announce_response.headers.get("apple-response") {
-            let decoded = STANDARD.decode(format!("{response}==")).map_err(|error| {
-                RaopError::InvalidResponse(format!("invalid Apple-Response: {error}"))
-            })?;
-            if decoded.is_empty() {
-                return Err(RaopError::InvalidResponse("empty Apple-Response".into()));
-            }
-        }
         let transport = format!(
             "RTP/AVP/UDP;unicast;mode=record;timing_port={};control_port={};",
             timing_port, control_port
@@ -505,8 +484,9 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
         headers: &[(&str, &str)],
     ) -> Result<Response, RaopError> {
         let mut request = format!(
-            "{method} rtsp://mi2play/streamid=0 RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\nUser-Agent: Mi2Play/0.1\r\n",
-            self.cseq, self.session
+            "{method} rtsp://mi2play/streamid=0 RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n\
+User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\n",
+            self.cseq, self.session, self.client_instance
         );
         request.push_str(&format!(
             "DACP-ID: {}\r\nActive-Remote: {}\r\nClient-Instance: {}\r\n",
@@ -564,8 +544,9 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
                 "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response_hash}\""
             );
             let mut retry = format!(
-                "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\nUser-Agent: Mi2Play/0.1\r\nAuthorization: {authorization}\r\n",
-                self.cseq, self.session
+                "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n\
+User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
+                self.cseq, self.session, self.client_instance
             );
             for (name, value) in headers {
                 retry.push_str(&format!("{name}: {value}\r\n"));
