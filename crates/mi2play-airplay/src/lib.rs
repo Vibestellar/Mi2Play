@@ -16,7 +16,8 @@ use alac_encoder::{AlacEncoder, FormatDescription};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use md5::{Digest, Md5};
 use rand::RngCore;
-use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
+use rsa::{Oaep, RsaPublicKey};
+use sha1::Sha1;
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -313,6 +314,10 @@ impl RaopClient {
             IpAddr::V4(ip) => format!("IN IP4 {ip}"),
             IpAddr::V6(ip) => format!("IN IP6 {ip}"),
         };
+        let remote_ip_text = match endpoint.address.ip() {
+            IpAddr::V4(ip) => format!("IN IP4 {ip}"),
+            IpAddr::V6(ip) => format!("IN IP6 {ip}"),
+        };
         let encrypted_key = rsa_encrypt_key(&client.aes_key)?;
         let key = STANDARD
             .encode(encrypted_key)
@@ -326,7 +331,7 @@ impl RaopClient {
             "v=0\r\no=iTunes {} 0 {}\r\ns=iTunes\r\nc={}\r\nt=0 0\r\n\
 m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 {} 255 0 0 {}\r\n\
 a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
-            client.session, local_ip_text, local_ip_text, channels, sample_rate, key, iv
+            client.session, local_ip_text, remote_ip_text, channels, sample_rate, key, iv
         );
         client
             .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
@@ -932,7 +937,7 @@ fn rsa_encrypt_key(key: &[u8; 16]) -> Result<Vec<u8>, RaopError> {
     )
     .map_err(|error| RaopError::Crypto(error.to_string()))?;
     public
-        .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, key)
+        .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), key)
         .map_err(|error| RaopError::Crypto(error.to_string()))
 }
 
