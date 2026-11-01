@@ -795,10 +795,44 @@ async fn receive_rtsp(
     let mut data: Option<TcpStream> = None;
     let mut data_ports: Option<(u16, u16)> = None;
     let mut sent_options = false;
+    let mut session_id = String::new();
+    let mut presentation_url = format!("rtsp://{host}/wfd1.0/streamid=0");
     loop {
         let message = read_rtsp(&mut control, &mut input).await?;
         let cseq = header(&message, "cseq").unwrap_or("0").to_string();
-        if message.starts_with("OPTIONS") {
+        let start_line = message.lines().next().unwrap_or_default();
+        tracing::debug!(start_line, cseq, "MiPlay RTSP message received");
+        if message.starts_with("RTSP/1.0") {
+            if cseq == "2" && message.contains("200") {
+                session_id = header(&message, "session")
+                    .and_then(|value| value.split(';').next())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                if session_id.is_empty() {
+                    return Err(ProtocolError::InvalidRtsp);
+                }
+                tracing::debug!(%session_id, "MiPlay RTSP SETUP accepted");
+                control
+                    .write_all(
+                        format!(
+                            "PLAY {presentation_url} RTSP/1.0\r\n\
+                             User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                             CSeq: 3\r\n\
+                             Session: {session_id}\r\n\
+                             Content-Length: 0\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+            } else if cseq == "3" && message.contains("200") {
+                tracing::info!(%session_id, "MiPlay RTSP media playback started");
+                if let Some(audio) = data.take() {
+                    receive_rtp(audio, keys, events).await?;
+                    return Ok(());
+                }
+            }
+        } else if message.starts_with("OPTIONS") {
             let response = format!(
                 "RTSP/1.0 200 OK\r\n\
                  User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
@@ -872,6 +906,14 @@ async fn receive_rtsp(
                     .await?;
             }
         } else if message.starts_with("SET_PARAMETER") {
+            if let Some(url) = message
+                .lines()
+                .find_map(|line| line.strip_prefix("wfd_presentation_URL:"))
+                .and_then(|line| line.split_whitespace().next())
+            {
+                presentation_url = url.to_owned();
+                tracing::debug!(%presentation_url, "MiPlay RTSP presentation URL received");
+            }
             control
                 .write_all(
                     format!(
@@ -888,7 +930,7 @@ async fn receive_rtsp(
                 control
                     .write_all(
                         format!(
-                            "SETUP rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\n\
+                            "SETUP {presentation_url} RTSP/1.0\r\n\
                              User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
                              CSeq: 2\r\n\
                              Transport: RTP/AVP/TCP;interleaved=0-1\r\n\
@@ -922,18 +964,6 @@ async fn receive_rtsp(
                          User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
                          CSeq: {cseq}\r\n\
                          Content-Length: 0\r\n\r\n"
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-        } else if message.starts_with("RTSP/1.0") && message.contains("CSeq: 2") {
-            control
-                .write_all(
-                    format!(
-                        "PLAY rtsp://{host}/wfd1.0/streamid=0 RTSP/1.0\r\n\
-                         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
-                         CSeq: 3\r\n\
-                         Session: 1\r\n\r\n"
                     )
                     .as_bytes(),
                 )
