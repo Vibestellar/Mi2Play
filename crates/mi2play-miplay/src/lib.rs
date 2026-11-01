@@ -1036,19 +1036,21 @@ async fn receive_rtp(
         let payload = rtp_payload(&packet)?;
         for ts in payload.chunks_exact(188) {
             for aac in demuxer.push(ts)? {
-                let pcm = decode_aac(&aac)?;
-                let pcm_bytes = pcm.len();
-                events
-                    .send(SessionEvent::Audio(PcmAudioFrame {
-                        sequence: 0,
-                        timestamp: 0,
-                        sample_rate: 48_000,
-                        channels: 2,
-                        pcm,
-                    }))
-                    .await
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
-                tracing::trace!(pcm_bytes, "MiPlay decoded PCM frame");
+                for frame in split_adts_frames(&aac)? {
+                    let pcm = decode_aac(&frame)?;
+                    let pcm_bytes = pcm.len();
+                    events
+                        .send(SessionEvent::Audio(PcmAudioFrame {
+                            sequence: 0,
+                            timestamp: 0,
+                            sample_rate: 48_000,
+                            channels: 2,
+                            pcm,
+                        }))
+                        .await
+                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                    tracing::trace!(pcm_bytes, "MiPlay decoded PCM frame");
+                }
             }
         }
     }
@@ -1160,6 +1162,44 @@ impl TsDemuxer {
 
 fn is_adts(data: &[u8]) -> bool {
     data.len() >= 7 && data[0] == 0xff && data[1] & 0xf6 == 0xf0
+}
+
+fn adts_header_len(data: &[u8]) -> Result<usize, ProtocolError> {
+    if !is_adts(data) {
+        return Err(ProtocolError::Aac("invalid ADTS sync word".into()));
+    }
+    Ok(if data[1] & 1 == 0 { 9 } else { 7 })
+}
+
+fn adts_frame_len(data: &[u8]) -> Result<usize, ProtocolError> {
+    if data.len() < 7 || !is_adts(data) {
+        return Err(ProtocolError::Aac("invalid ADTS header".into()));
+    }
+    Ok((usize::from(data[3] & 0x03) << 11)
+        | (usize::from(data[4]) << 3)
+        | (usize::from(data[5]) >> 5))
+}
+
+fn split_adts_frames(data: &[u8]) -> Result<Vec<Vec<u8>>, ProtocolError> {
+    if !is_adts(data) {
+        return Ok(vec![data.to_vec()]);
+    }
+    let mut frames = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let remaining = &data[offset..];
+        let header_len = adts_header_len(remaining)?;
+        let frame_len = adts_frame_len(remaining)?;
+        if frame_len <= header_len || frame_len > remaining.len() {
+            return Err(ProtocolError::Aac(format!(
+                "truncated ADTS frame: declared {frame_len}, remaining {}",
+                remaining.len()
+            )));
+        }
+        frames.push(remaining[..frame_len].to_vec());
+        offset += frame_len;
+    }
+    Ok(frames)
 }
 
 fn decode_aac(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
@@ -1281,6 +1321,16 @@ mod tests {
             ))
             .unwrap()
         );
+    }
+
+    #[test]
+    fn splits_multiple_adts_frames_from_one_pes() {
+        let first = [0xff, 0xf9, 0x4c, 0x80, 0x01, 0x9f, 0xfc, 1, 2, 3, 4, 5];
+        let second = [0xff, 0xf9, 0x4c, 0x80, 0x01, 0x7f, 0xfc, 6, 7, 8, 9];
+        let mut payload = first.to_vec();
+        payload.extend_from_slice(&second);
+        let frames = split_adts_frames(&payload).unwrap();
+        assert_eq!(frames, vec![first.to_vec(), second.to_vec()]);
     }
 
     #[test]
