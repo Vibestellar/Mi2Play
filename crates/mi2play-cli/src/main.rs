@@ -529,6 +529,7 @@ async fn bridge_session(
     channels: u8,
     password: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const RAOP_SAMPLE_RATE: u32 = 44_100;
     let peer = session.peer_addr();
     let (events_tx, mut events_rx) = mpsc::channel(32);
     tokio::spawn(async move {
@@ -549,13 +550,17 @@ async fn bridge_session(
                     client = Some(
                         RaopClient::connect_with_password(
                             &endpoint,
-                            sample_rate,
+                            RAOP_SAMPLE_RATE,
                             channels,
                             password.as_deref(),
                         )
                         .await?,
                     );
-                    bridge = Some(PcmToRaop::new(sample_rate, channels)?);
+                    bridge = Some(PcmToRaop::new_resampled(
+                        sample_rate,
+                        RAOP_SAMPLE_RATE,
+                        channels,
+                    )?);
                 }
                 tracing::trace!(
                     sequence = frame.sequence,

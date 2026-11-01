@@ -103,19 +103,30 @@ pub struct PcmAudioFrame {
 pub struct PcmToRaop {
     encoder: AlacEncoder,
     input: FormatDescription,
+    input_sample_rate: u32,
     sample_rate: u32,
     channels: u8,
     samples_per_packet: usize,
     pending: Vec<u8>,
+    resample_input: Vec<i16>,
+    resample_phase: f64,
     next_sequence: u16,
     next_timestamp: u32,
 }
 
 impl PcmToRaop {
     pub fn new(sample_rate: u32, channels: u8) -> Result<Self, RaopError> {
-        if channels == 0 || channels > 2 || sample_rate == 0 {
+        Self::new_resampled(sample_rate, sample_rate, channels)
+    }
+
+    pub fn new_resampled(
+        input_sample_rate: u32,
+        sample_rate: u32,
+        channels: u8,
+    ) -> Result<Self, RaopError> {
+        if channels == 0 || channels > 2 || input_sample_rate == 0 || sample_rate == 0 {
             return Err(RaopError::UnsupportedAudioFormat {
-                sample_rate,
+                sample_rate: input_sample_rate,
                 channels,
             });
         }
@@ -124,17 +135,20 @@ impl PcmToRaop {
         Ok(Self {
             encoder: AlacEncoder::new(&output),
             input,
+            input_sample_rate,
             sample_rate,
             channels,
             samples_per_packet: 352,
             pending: Vec::new(),
+            resample_input: Vec::new(),
+            resample_phase: 0.0,
             next_sequence: 0,
             next_timestamp: 0,
         })
     }
 
     pub fn push(&mut self, frame: PcmAudioFrame) -> Result<Vec<AudioPacket>, RaopError> {
-        if frame.sample_rate != self.sample_rate || frame.channels != self.channels {
+        if frame.sample_rate != self.input_sample_rate || frame.channels != self.channels {
             return Err(RaopError::UnsupportedAudioFormat {
                 sample_rate: frame.sample_rate,
                 channels: frame.channels,
@@ -144,11 +158,44 @@ impl PcmToRaop {
         if frame.pcm.len() % bytes_per_sample != 0 {
             return Err(RaopError::InvalidPcmLength(frame.pcm.len()));
         }
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.resample_input.is_empty() {
             self.next_sequence = frame.sequence;
             self.next_timestamp = frame.timestamp;
         }
-        self.pending.extend_from_slice(&frame.pcm);
+        if self.input_sample_rate == self.sample_rate {
+            self.pending.extend_from_slice(&frame.pcm);
+        } else {
+            self.resample_input.extend(
+                frame
+                    .pcm
+                    .chunks_exact(2)
+                    .map(|sample| i16::from_le_bytes([sample[0], sample[1]])),
+            );
+            let input_frames = self.resample_input.len() / self.channels as usize;
+            let ratio = self.input_sample_rate as f64 / self.sample_rate as f64;
+            while self.resample_phase + 1.0 < input_frames as f64 {
+                let source = self.resample_phase.floor() as usize;
+                let fraction = self.resample_phase.fract();
+                for channel in 0..self.channels as usize {
+                    let first =
+                        self.resample_input[source * self.channels as usize + channel] as f64;
+                    let second =
+                        self.resample_input[(source + 1) * self.channels as usize + channel] as f64;
+                    let sample = (first + (second - first) * fraction)
+                        .round()
+                        .clamp(i16::MIN as f64, i16::MAX as f64)
+                        as i16;
+                    self.pending.extend_from_slice(&sample.to_le_bytes());
+                }
+                self.resample_phase += ratio;
+            }
+            let consumed = self.resample_phase.floor() as usize;
+            if consumed > 0 {
+                self.resample_input
+                    .drain(..consumed * self.channels as usize);
+                self.resample_phase -= consumed as f64;
+            }
+        }
         let packet_bytes = self.samples_per_packet * bytes_per_sample;
         let mut packets = Vec::new();
         while self.pending.len() >= packet_bytes {
