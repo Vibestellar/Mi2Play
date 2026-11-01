@@ -1203,6 +1203,17 @@ fn split_adts_frames(data: &[u8]) -> Result<Vec<Vec<u8>>, ProtocolError> {
 }
 
 fn decode_aac(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    if is_adts(data) {
+        let mut output = Vec::new();
+        for frame in split_adts_frames(data)? {
+            output.extend_from_slice(&decode_aac_frame(&frame)?);
+        }
+        return Ok(output);
+    }
+    decode_aac_frame(data)
+}
+
+fn decode_aac_frame(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     use std::io::Cursor;
     use symphonia::core::{
         audio::{AudioBufferRef, Signal},
