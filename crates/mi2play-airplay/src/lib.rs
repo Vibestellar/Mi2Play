@@ -224,6 +224,8 @@ impl PcmToRaop {
 pub struct RaopClient {
     rtsp: TcpStream,
     session: String,
+    negotiated_session: Option<String>,
+    rtsp_url: String,
     cseq: u32,
     ssrc: u32,
     audio: Arc<UdpSocket>,
@@ -279,15 +281,17 @@ impl RaopClient {
         let audio_port = audio.local_addr()?.port();
         let control_port = control.local_addr()?.port();
         let timing_port = timing.local_addr()?.port();
-        let session = format!("{:08x}", rand_seed());
+        let session = format!("{:010}", rand_seed());
         let mut aes_key = [0u8; 16];
         let mut aes_iv = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut aes_key);
         rand::thread_rng().fill_bytes(&mut aes_iv);
-        let client_instance = format!("{:016X}", rand_seed() as u64);
+        let client_instance = format!("{:016x}", rand_seed() as u64);
         let mut client = Self {
             rtsp,
+            rtsp_url: format!("rtsp://{}/{}", endpoint.address.ip(), session),
             session,
+            negotiated_session: None,
             cseq: 1,
             ssrc: rand_seed(),
             audio: Arc::new(audio),
@@ -354,6 +358,7 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
                 .ok_or(RaopError::MissingHeader("Transport"))?,
             endpoint.address,
         )?;
+        client.negotiated_session = response.headers.get("session").cloned();
         client.remote_audio = remote_audio;
         client.remote_control = remote_control;
         client.remote_timing = remote_timing;
@@ -535,14 +540,19 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
         headers: &[(&str, &str)],
     ) -> Result<Response, RaopError> {
         let mut request = format!(
-            "{method} rtsp://mi2play/streamid=0 RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n\
-User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\n",
-            self.cseq, self.session, self.client_instance
+            "{method} {} RTSP/1.0\r\nCSeq: {}\r\n\
+User-Agent: iTunes/7.6.2 (Windows; N;)\r\nClient-Instance: {}\r\n",
+            if method == "OPTIONS" {
+                "*"
+            } else {
+                &self.rtsp_url
+            },
+            self.cseq,
+            self.client_instance
         );
-        request.push_str(&format!(
-            "DACP-ID: {}\r\nActive-Remote: {}\r\nClient-Instance: {}\r\n",
-            self.client_instance, self.session, self.client_instance
-        ));
+        if let Some(session) = &self.negotiated_session {
+            request.push_str(&format!("Session: {session}\r\n"));
+        }
         for (name, value) in headers {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -583,7 +593,7 @@ User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\n",
             let uri = if method == "OPTIONS" {
                 "*"
             } else {
-                "rtsp://mi2play/streamid=0"
+                &self.rtsp_url
             };
             let username = if realm.eq_ignore_ascii_case("raop") {
                 "iTunes"
@@ -597,10 +607,13 @@ User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\n",
                 "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response_hash}\""
             );
             let mut retry = format!(
-                "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\n\
-User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
-                self.cseq, self.session, self.client_instance
+                "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\n\
+User-Agent: iTunes/7.6.2 (Windows; N;)\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
+                self.cseq, self.client_instance
             );
+            if let Some(session) = &self.negotiated_session {
+                retry.push_str(&format!("Session: {session}\r\n"));
+            }
             for (name, value) in headers {
                 retry.push_str(&format!("{name}: {value}\r\n"));
             }
