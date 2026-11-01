@@ -500,9 +500,11 @@ User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\n",
         }
         request.push_str("\r\n");
         request.push_str(body);
+        trace_rtsp_request(method, self.cseq, headers, body, false);
         self.rtsp.write_all(request.as_bytes()).await?;
         self.cseq += 1;
         let response = read_response(&mut self.rtsp).await?;
+        trace_rtsp_response(method, self.cseq - 1, &response);
         tracing::debug!(
             method,
             cseq = self.cseq - 1,
@@ -556,9 +558,11 @@ User-Agent: iTunes/10.6.1\r\nClient-Instance: {}\r\nAuthorization: {authorizatio
             }
             retry.push_str("\r\n");
             retry.push_str(body);
+            trace_rtsp_request(method, self.cseq, headers, body, true);
             self.rtsp.write_all(retry.as_bytes()).await?;
             self.cseq += 1;
             let response = read_response(&mut self.rtsp).await?;
+            trace_rtsp_response(method, self.cseq - 1, &response);
             tracing::debug!(
                 method,
                 cseq = self.cseq - 1,
@@ -588,6 +592,7 @@ struct Response {
     status: u16,
     reason: String,
     headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
 }
 
 async fn read_response(stream: &mut TcpStream) -> Result<Response, RaopError> {
@@ -623,17 +628,112 @@ async fn read_response(stream: &mut TcpStream) -> Result<Response, RaopError> {
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| RaopError::InvalidResponse(status_line.into()))?;
     let reason = status_parts.next().unwrap_or_default().into();
-    let mut headers = std::collections::HashMap::new();
+    let mut headers = std::collections::HashMap::<String, String>::new();
     for line in lines.filter(|line| !line.is_empty()) {
         if let Some((name, value)) = line.split_once(':') {
             headers.insert(name.trim().to_ascii_lowercase(), value.trim().into());
         }
     }
+    let body_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    while buffer.len() < header_end + body_length {
+        let mut chunk = [0; 1024];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(RaopError::InvalidResponse("truncated response body".into()));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
     Ok(Response {
         status,
         reason,
         headers,
+        body: buffer[header_end..header_end + body_length].to_vec(),
     })
+}
+
+fn trace_rtsp_request(
+    method: &str,
+    cseq: u32,
+    headers: &[(&str, &str)],
+    body: &str,
+    authenticated: bool,
+) {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", redact_rtsp_value(name, value)))
+        .collect::<Vec<_>>();
+    tracing::trace!(
+        method,
+        cseq,
+        authenticated,
+        headers = ?headers,
+        body_bytes = body.len(),
+        body = %summarize_rtsp_body(body),
+        "RAOP RTSP request"
+    );
+}
+
+fn trace_rtsp_response(method: &str, cseq: u32, response: &Response) {
+    let headers = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", redact_rtsp_value(name, value)))
+        .collect::<Vec<_>>();
+    tracing::trace!(
+        method,
+        cseq,
+        status = response.status,
+        reason = %response.reason,
+        headers = ?headers,
+        body_bytes = response.body.len(),
+        body = %summarize_rtsp_bytes(&response.body),
+        "RAOP RTSP response details"
+    );
+}
+
+fn redact_rtsp_value(name: &str, value: &str) -> String {
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "apple-response"
+    ) {
+        "<redacted>".into()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn summarize_rtsp_body(body: &str) -> String {
+    if body.contains("rsaaeskey:") || body.contains("aesiv:") {
+        return body
+            .lines()
+            .map(|line| {
+                if line.starts_with("a=rsaaeskey:") {
+                    "a=rsaaeskey:<redacted>".to_owned()
+                } else if line.starts_with("a=aesiv:") {
+                    "a=aesiv:<redacted>".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\\n");
+    }
+    summarize_rtsp_bytes(body.as_bytes())
+}
+
+fn summarize_rtsp_bytes(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    if text.is_empty() {
+        "<empty>".into()
+    } else if text.len() > 512 {
+        format!("{}…", text.chars().take(512).collect::<String>())
+    } else {
+        text.to_owned()
+    }
 }
 
 fn parse_digest_challenge(value: &str) -> Option<(String, String)> {
