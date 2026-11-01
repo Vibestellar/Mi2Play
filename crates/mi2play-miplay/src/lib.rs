@@ -1216,12 +1216,45 @@ fn decode_aac(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
 fn decode_aac_frame(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     use std::io::Cursor;
     use symphonia::core::{
-        audio::{AudioBufferRef, Signal},
-        codecs::DecoderOptions,
-        formats::FormatOptions,
+        audio::Channels,
+        codecs::{CODEC_TYPE_AAC, CodecParameters, DecoderOptions},
+        formats::{FormatOptions, Packet},
         io::MediaSourceStream,
         probe::Hint,
     };
+    if is_adts(data) {
+        let header_len = adts_header_len(data)?;
+        let sample_rate = [
+            96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025,
+            8_000, 7_350,
+        ]
+        .get(usize::from((data[2] & 0x3c) >> 2))
+        .copied()
+        .ok_or_else(|| ProtocolError::Aac("invalid ADTS sample rate".into()))?;
+        let channels = match (data[2] & 1) << 2 | (data[3] & 0xc0) >> 6 {
+            1 => Channels::FRONT_CENTRE,
+            2 => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
+            value => {
+                return Err(ProtocolError::Aac(format!(
+                    "unsupported ADTS channel configuration {value}"
+                )));
+            }
+        };
+        let mut params = CodecParameters::new();
+        params
+            .for_codec(CODEC_TYPE_AAC)
+            .with_sample_rate(sample_rate)
+            .with_channels(channels);
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&params, &DecoderOptions::default())
+            .map_err(|error| ProtocolError::Aac(error.to_string()))?;
+        let packet = Packet::new_from_slice(0, 0, 1024, &data[header_len..]);
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|error| ProtocolError::Aac(error.to_string()))?;
+        return pcm_from_audio_buffer(decoded);
+    }
+
     let mut hint = Hint::new();
     hint.with_extension("aac");
     let source = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
@@ -1246,6 +1279,13 @@ fn decode_aac_frame(data: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     let decoded = decoder
         .decode(&packet)
         .map_err(|error| ProtocolError::Aac(error.to_string()))?;
+    pcm_from_audio_buffer(decoded)
+}
+
+fn pcm_from_audio_buffer(
+    decoded: symphonia::core::audio::AudioBufferRef<'_>,
+) -> Result<Vec<u8>, ProtocolError> {
+    use symphonia::core::audio::{AudioBufferRef, Signal};
     let mut output = Vec::new();
     match decoded {
         AudioBufferRef::S16(buffer) => {
