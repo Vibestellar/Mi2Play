@@ -239,6 +239,7 @@ pub struct RaopClient {
     aes_key: [u8; 16],
     aes_iv: [u8; 16],
     client_instance: String,
+    encrypted: bool,
     password: Option<String>,
     auth: Option<(String, String)>,
     backlog: RtpBacklog,
@@ -305,6 +306,7 @@ impl RaopClient {
             aes_key,
             aes_iv,
             client_instance,
+            encrypted: false,
             password: password.map(str::to_owned),
             auth: None,
             backlog: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
@@ -322,20 +324,25 @@ impl RaopClient {
             IpAddr::V4(ip) => format!("IN IP4 {ip}"),
             IpAddr::V6(ip) => format!("IN IP6 {ip}"),
         };
-        let encrypted_key = rsa_encrypt_key(&client.aes_key)?;
-        let key = STANDARD
-            .encode(encrypted_key)
-            .trim_end_matches('=')
-            .to_owned();
-        let iv = STANDARD
-            .encode(client.aes_iv)
-            .trim_end_matches('=')
-            .to_owned();
+        let crypto_sdp = if client.encrypted {
+            let encrypted_key = rsa_encrypt_key(&client.aes_key)?;
+            let key = STANDARD
+                .encode(encrypted_key)
+                .trim_end_matches('=')
+                .to_owned();
+            let iv = STANDARD
+                .encode(client.aes_iv)
+                .trim_end_matches('=')
+                .to_owned();
+            format!("a=rsaaeskey:{key}\r\na=aesiv:{iv}\r\n")
+        } else {
+            String::new()
+        };
         let sdp = format!(
             "v=0\r\no=iTunes {} 0 {}\r\ns=iTunes\r\nc={}\r\nt=0 0\r\n\
 m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 {} 255 0 0 {}\r\n\
-a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
-            client.session, local_ip_text, remote_ip_text, channels, sample_rate, key, iv
+{}",
+            client.session, local_ip_text, remote_ip_text, channels, sample_rate, crypto_sdp
         );
         client
             .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
@@ -388,7 +395,9 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
         rtp.extend_from_slice(&packet.timestamp.to_be_bytes());
         rtp.extend_from_slice(&self.ssrc.to_be_bytes());
         let mut payload = packet.payload.clone();
-        encrypt_rtp_payload(&mut payload, &self.aes_key, &self.aes_iv);
+        if self.encrypted {
+            encrypt_rtp_payload(&mut payload, &self.aes_key, &self.aes_iv);
+        }
         rtp.extend_from_slice(&payload);
         if let Ok(mut backlog) = self.backlog.lock() {
             backlog.push_back((packet.sequence, rtp.clone()));
