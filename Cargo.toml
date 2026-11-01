@@ -19,6 +19,7 @@ alac-encoder = "0.3"
 cbc = { version = "0.1", features = ["alloc"] }
 hex = "0.4"
 hmac = "0.12"
+if-addrs = "0.15"
 md-5 = "0.10"
 mi2play-core = { path = "crates/mi2play-core" }
 mi2play-airplay = { path = "crates/mi2play-airplay" }

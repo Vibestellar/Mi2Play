@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -64,7 +64,7 @@ pub fn discover_raop(timeout: Duration) -> Result<Vec<RaopEndpoint>, RaopError> 
         if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
             for address in &info.addresses {
                 let endpoint = RaopEndpoint {
-                    address: SocketAddr::new(address.to_ip_addr(), info.port),
+                    address: with_ipv6_scope(SocketAddr::new(address.to_ip_addr(), info.port)),
                     name: info.fullname.clone(),
                 };
                 if !endpoints.contains(&endpoint) {
@@ -224,10 +224,11 @@ impl RaopClient {
             });
         }
         let rtsp = TcpStream::connect(endpoint.address).await?;
-        let local_ip = rtsp.local_addr()?.ip();
-        let audio = UdpSocket::bind((local_ip, 0)).await?;
-        let control = UdpSocket::bind((local_ip, 0)).await?;
-        let timing = UdpSocket::bind((local_ip, 0)).await?;
+        let local_addr = rtsp.local_addr()?;
+        let local_ip = local_addr.ip();
+        let audio = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let control = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let timing = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
         let audio_port = audio.local_addr()?.port();
         let control_port = control.local_addr()?.port();
         let timing_port = timing.local_addr()?.port();
@@ -321,7 +322,7 @@ a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
                 .headers
                 .get("transport")
                 .ok_or(RaopError::MissingHeader("Transport"))?,
-            endpoint.address.ip(),
+            endpoint.address,
         )?;
         client.remote_audio = remote_audio;
         client.remote_control = remote_control;
@@ -678,7 +679,7 @@ fn md5_hex(value: &[u8]) -> String {
 
 fn parse_transport(
     value: &str,
-    ip: IpAddr,
+    endpoint: SocketAddr,
 ) -> Result<(SocketAddr, SocketAddr, SocketAddr), RaopError> {
     let mut audio = None;
     let mut control = None;
@@ -698,10 +699,63 @@ fn parse_transport(
     let control = control.ok_or(RaopError::MissingHeader("Transport control_port"))?;
     let timing = timing.unwrap_or(0);
     Ok((
-        SocketAddr::new(ip, audio),
-        SocketAddr::new(ip, control),
-        SocketAddr::new(ip, timing),
+        SocketAddr::new(endpoint.ip(), audio).with_scope_from(endpoint),
+        SocketAddr::new(endpoint.ip(), control).with_scope_from(endpoint),
+        SocketAddr::new(endpoint.ip(), timing).with_scope_from(endpoint),
     ))
+}
+
+fn with_ipv6_scope(address: SocketAddr) -> SocketAddr {
+    let SocketAddr::V6(mut address) = address else {
+        return address;
+    };
+    if address.scope_id() != 0 || !address.ip().is_unicast_link_local() {
+        return SocketAddr::V6(address);
+    }
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        if let Some(interface) = interfaces.iter().find(|interface| {
+            interface.is_oper_up()
+                && interface.is_link_local()
+                && !interface.is_loopback()
+                && interface.index.is_some()
+        }) {
+            address.set_scope_id(interface.index.unwrap_or_default());
+        }
+    }
+    SocketAddr::V6(address)
+}
+
+fn local_bind_addr(address: SocketAddr, remote: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(address) => {
+            let scope = if address.scope_id() != 0 {
+                address.scope_id()
+            } else {
+                match remote {
+                    SocketAddr::V6(remote) => remote.scope_id(),
+                    SocketAddr::V4(_) => 0,
+                }
+            };
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, scope))
+        }
+    }
+}
+
+trait SocketAddrScope {
+    fn with_scope_from(self, source: SocketAddr) -> SocketAddr;
+}
+
+impl SocketAddrScope for SocketAddr {
+    fn with_scope_from(self, source: SocketAddr) -> SocketAddr {
+        match (self, source) {
+            (SocketAddr::V6(mut address), SocketAddr::V6(source)) => {
+                address.set_scope_id(source.scope_id());
+                SocketAddr::V6(address)
+            }
+            (address, _) => address,
+        }
+    }
 }
 
 fn ntp_now() -> [u8; 8] {
@@ -813,7 +867,7 @@ mod tests {
         assert_eq!(
             parse_transport(
                 "RTP/AVP/UDP;server_port=6000;control_port=6001;timing_port=6002",
-                "192.0.2.1".parse().unwrap()
+                "192.0.2.1:7000".parse().unwrap()
             )
             .unwrap(),
             (

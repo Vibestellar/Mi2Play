@@ -496,6 +496,7 @@ dependencies = [
  "base64",
  "cbc",
  "hex",
+ "if-addrs",
  "md-5",
  "mdns-sd",
  "rand",
