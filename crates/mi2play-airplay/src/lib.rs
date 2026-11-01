@@ -16,8 +16,7 @@ use alac_encoder::{AlacEncoder, FormatDescription};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use md5::{Digest, Md5};
 use rand::RngCore;
-use rsa::{Oaep, RsaPublicKey};
-use sha1::Sha1;
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -933,7 +932,7 @@ fn rsa_encrypt_key(key: &[u8; 16]) -> Result<Vec<u8>, RaopError> {
     )
     .map_err(|error| RaopError::Crypto(error.to_string()))?;
     public
-        .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), key)
+        .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, key)
         .map_err(|error| RaopError::Crypto(error.to_string()))
 }
 
