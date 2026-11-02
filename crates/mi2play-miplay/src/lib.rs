@@ -360,6 +360,7 @@ impl MiPlaySession {
         let own_challenge = hex::encode(own_challenge);
         let mut pending_auth: Option<(u16, Vec<u8>)> = None;
         let mut stream_keys = None;
+        let mut volume = 50u32;
         write_frame(
             &mut self.stream,
             0,
@@ -550,7 +551,10 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, GET_VOLUME) => {
-                    let encrypted = write_cipher.encrypt(&[50])?;
+                    let mut response = Vec::with_capacity(5);
+                    response.push(0);
+                    response.extend_from_slice(&volume.to_be_bytes());
+                    let encrypted = write_cipher.encrypt(&response)?;
                     write_frame(
                         &mut self.stream,
                         0,
@@ -627,6 +631,18 @@ impl MiPlaySession {
                         &encrypted,
                     )
                     .await?;
+                    if let Some(value) = decode_volume_percent(&frame.body) {
+                        volume = value;
+                        let notification = write_cipher.encrypt(&volume_notification(volume))?;
+                        write_frame(
+                            &mut self.stream,
+                            0,
+                            NOTIFY,
+                            frame.sequence.wrapping_add(1),
+                            &notification,
+                        )
+                        .await?;
+                    }
                 }
                 (0, SET_MEDIA_INFO) | (0, GET_MEDIA_INFO) => {
                     if frame.command == SET_MEDIA_INFO {
@@ -781,6 +797,24 @@ fn parse_wfd_url(value: &str) -> Result<(String, u16), ProtocolError> {
         port.parse()
             .map_err(|_| ProtocolError::InvalidUrl(value.into()))?,
     ))
+}
+
+fn decode_volume_percent(body: &[u8]) -> Option<u32> {
+    let bytes = match body {
+        [a, b, c, d] => [*a, *b, *c, *d],
+        [0, a, b, c, d] => [*a, *b, *c, *d],
+        _ => return None,
+    };
+    Some(i32::from_be_bytes(bytes).clamp(0, 100) as u32)
+}
+
+fn volume_notification(volume: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.push(6);
+    body.extend_from_slice(b"volume");
+    body.push(7);
+    body.extend_from_slice(&volume.min(100).to_be_bytes());
+    body
 }
 
 async fn receive_rtsp(

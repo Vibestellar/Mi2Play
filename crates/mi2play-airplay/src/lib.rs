@@ -245,8 +245,8 @@ pub struct RaopClient {
     auth_setup: bool,
     cseq: u32,
     ssrc: u32,
-    audio: Arc<UdpSocket>,
-    control: Arc<UdpSocket>,
+    audio: Option<Arc<UdpSocket>>,
+    control: Option<Arc<UdpSocket>>,
     _timing: Arc<UdpSocket>,
     remote_audio: SocketAddr,
     remote_control: SocketAddr,
@@ -294,10 +294,7 @@ impl RaopClient {
         let rtsp = TcpStream::connect(endpoint.address).await?;
         let local_addr = rtsp.local_addr()?;
         let local_ip = local_addr.ip();
-        let audio = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
-        let control = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
         let timing = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
-        let control_port = control.local_addr()?.port();
         let timing_port = timing.local_addr()?.port();
         let session = format!("{:010}", rand_seed());
         let mut aes_key = [0u8; 16];
@@ -314,14 +311,14 @@ impl RaopClient {
             negotiated_session: None,
             cseq: 1,
             ssrc: rand_seed(),
-            audio: Arc::new(audio),
-            control: Arc::new(control),
+            audio: None,
+            control: None,
             _timing: Arc::new(timing),
             remote_audio: SocketAddr::new(endpoint.address.ip(), 0),
             remote_control: SocketAddr::new(endpoint.address.ip(), 0),
             remote_timing: SocketAddr::new(endpoint.address.ip(), 0),
-            next_sequence: 0,
-            next_timestamp: 0,
+            next_sequence: rand_seed() as u16,
+            next_timestamp: ntp_timestamp(sample_rate),
             aes_key,
             aes_iv,
             client_instance,
@@ -382,6 +379,13 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         client
             .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
             .await?;
+        let control = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let audio = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let control_port = control.local_addr()?.port();
+        let audio = Arc::new(audio);
+        let control = Arc::new(control);
+        client.audio = Some(Arc::clone(&audio));
+        client.control = Some(Arc::clone(&control));
         let transport = format!(
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
             control_port, timing_port
@@ -400,8 +404,8 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         client.remote_audio = remote_audio;
         client.remote_control = remote_control;
         client.remote_timing = remote_timing;
-        client.audio.connect(remote_audio).await?;
-        client.control.connect(remote_control).await?;
+        audio.connect(remote_audio).await?;
+        control.connect(remote_control).await?;
         if remote_timing.port() != 0 {
             client._timing.connect(remote_timing).await?;
         }
@@ -431,6 +435,8 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         }
         if self.first_packet {
             self.control
+                .as_ref()
+                .expect("RAOP control socket initialized")
                 .send(&build_sync_packet(
                     self.next_timestamp,
                     self.sample_rate,
@@ -462,7 +468,11 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
             payload_bytes = packet.payload.len(),
             "RAOP RTP audio packet"
         );
-        self.audio.send(&rtp).await?;
+        self.audio
+            .as_ref()
+            .expect("RAOP audio socket initialized")
+            .send(&rtp)
+            .await?;
         self.first_packet = false;
         self.next_sequence = sequence.wrapping_add(1);
         self.next_timestamp = timestamp.wrapping_add(352);
@@ -527,7 +537,11 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
     }
 
     fn start_rtp_workers(&self) {
-        let control = Arc::clone(&self.control);
+        let control = Arc::clone(
+            self.control
+                .as_ref()
+                .expect("RAOP control socket initialized"),
+        );
         let backlog = Arc::clone(&self.backlog);
         let running = Arc::clone(&self.running);
         let stream_timestamp = Arc::clone(&self.stream_timestamp);

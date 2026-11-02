@@ -615,12 +615,12 @@ async fn bridge_session(
                     let volume = match payload.as_slice() {
                         [value] if *value <= 100 => Some(*value),
                         [0, a, b, c, d] => {
-                            let value = u32::from_be_bytes([*a, *b, *c, *d]);
-                            (value <= 100).then_some(value as u8)
+                            let value = i32::from_be_bytes([*a, *b, *c, *d]);
+                            Some(value.clamp(0, 100) as u8)
                         }
                         [a, b, c, d] => {
-                            let value = u32::from_be_bytes([*a, *b, *c, *d]);
-                            (value <= 100).then_some(value as u8)
+                            let value = i32::from_be_bytes([*a, *b, *c, *d]);
+                            Some(value.clamp(0, 100) as u8)
                         }
                         _ => None,
                     };
@@ -635,6 +635,7 @@ async fn bridge_session(
                         }
                     } else {
                         tracing::warn!(
+                            payload = ?payload,
                             payload_bytes = payload.len(),
                             "Ignoring invalid MiPlay volume payload"
                         );
