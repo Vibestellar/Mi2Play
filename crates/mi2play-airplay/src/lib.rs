@@ -23,6 +23,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
 };
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const RTP_HEADER_LEN: usize = 12;
 type RtpBacklog = Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>;
@@ -75,6 +76,9 @@ pub fn discover_raop(timeout: Duration) -> Result<Vec<RaopEndpoint>, RaopError> 
                             || "iTunes/7.6.2 (Windows; N;)".to_owned(),
                             |_| "AirPlay/999.0.0".to_owned(),
                         ),
+                    auth_setup: info
+                        .get_property_val_str("et")
+                        .is_some_and(|value| value.contains('4')),
                 };
                 if !endpoints.contains(&endpoint) {
                     endpoints.push(endpoint);
@@ -91,6 +95,7 @@ pub struct RaopEndpoint {
     pub address: SocketAddr,
     pub name: String,
     pub user_agent: String,
+    pub auth_setup: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +242,7 @@ pub struct RaopClient {
     negotiated_session: Option<String>,
     rtsp_url: String,
     user_agent: String,
+    auth_setup: bool,
     cseq: u32,
     ssrc: u32,
     audio: Arc<UdpSocket>,
@@ -303,6 +309,7 @@ impl RaopClient {
             rtsp,
             rtsp_url: format!("rtsp://{}/{}", endpoint.address.ip(), session),
             user_agent: endpoint.user_agent.clone(),
+            auth_setup: endpoint.auth_setup,
             session,
             negotiated_session: None,
             cseq: 1,
@@ -328,6 +335,21 @@ impl RaopClient {
         };
 
         client.request("OPTIONS", "", &[]).await?;
+        if client.auth_setup {
+            let secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let public_key = PublicKey::from(&secret);
+            let mut auth_body = Vec::with_capacity(33);
+            auth_body.push(0x01);
+            auth_body.extend_from_slice(public_key.as_bytes());
+            client
+                .request_uri(
+                    "POST",
+                    "/auth-setup",
+                    &auth_body,
+                    &[("Content-Type", "application/octet-stream")],
+                )
+                .await?;
+        }
         let local_ip_text = match local_ip {
             IpAddr::V4(ip) => format!("IN IP4 {ip}"),
             IpAddr::V6(ip) => format!("IN IP6 {ip}"),
@@ -560,31 +582,57 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         body: &str,
         headers: &[(&str, &str)],
     ) -> Result<Response, RaopError> {
+        let target = if method == "OPTIONS" {
+            "*".to_owned()
+        } else {
+            self.rtsp_url.clone()
+        };
+        self.request_target(method, &target, body.as_bytes(), headers)
+            .await
+    }
+
+    async fn request_uri(
+        &mut self,
+        method: &str,
+        uri: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response, RaopError> {
+        self.request_target(method, uri, body, headers).await
+    }
+
+    async fn request_target(
+        &mut self,
+        method: &str,
+        target: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response, RaopError> {
         let mut request = format!(
-            "{method} {} RTSP/1.0\r\nCSeq: {}\r\n\
+            "{method} {target} RTSP/1.0\r\nCSeq: {}\r\n\
 User-Agent: {}\r\nClient-Instance: {}\r\n",
-            if method == "OPTIONS" {
-                "*"
-            } else {
-                &self.rtsp_url
-            },
-            self.cseq,
-            self.user_agent,
-            self.client_instance
-        );
+            self.cseq, self.user_agent, self.client_instance
+        )
+        .into_bytes();
         if let Some(session) = &self.negotiated_session {
-            request.push_str(&format!("Session: {session}\r\n"));
+            request.extend_from_slice(format!("Session: {session}\r\n").as_bytes());
         }
         for (name, value) in headers {
-            request.push_str(&format!("{name}: {value}\r\n"));
+            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
         if !body.is_empty() {
-            request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
         }
-        request.push_str("\r\n");
-        request.push_str(body);
-        trace_rtsp_request(method, self.cseq, headers, body, false);
-        self.rtsp.write_all(request.as_bytes()).await?;
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(body);
+        trace_rtsp_request(
+            method,
+            self.cseq,
+            headers,
+            &String::from_utf8_lossy(body),
+            false,
+        );
+        self.rtsp.write_all(&request).await?;
         self.cseq += 1;
         let response = read_response(&mut self.rtsp).await?;
         trace_rtsp_response(method, self.cseq - 1, &response);
@@ -612,11 +660,7 @@ User-Agent: {}\r\nClient-Instance: {}\r\n",
                     "unsupported WWW-Authenticate challenge".into(),
                 ));
             };
-            let uri = if method == "OPTIONS" {
-                "*"
-            } else {
-                &self.rtsp_url
-            };
+            let uri = if method == "OPTIONS" { "*" } else { target };
             let username = if realm.eq_ignore_ascii_case("raop") {
                 "iTunes"
             } else {
@@ -629,23 +673,30 @@ User-Agent: {}\r\nClient-Instance: {}\r\n",
                 "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response_hash}\""
             );
             let mut retry = format!(
-                "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\n\
+                "{method} {target} RTSP/1.0\r\nCSeq: {}\r\n\
 User-Agent: {}\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
                 self.cseq, self.user_agent, self.client_instance
-            );
+            )
+            .into_bytes();
             if let Some(session) = &self.negotiated_session {
-                retry.push_str(&format!("Session: {session}\r\n"));
+                retry.extend_from_slice(format!("Session: {session}\r\n").as_bytes());
             }
             for (name, value) in headers {
-                retry.push_str(&format!("{name}: {value}\r\n"));
+                retry.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
             }
             if !body.is_empty() {
-                retry.push_str(&format!("Content-Length: {}\r\n", body.len()));
+                retry.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
             }
-            retry.push_str("\r\n");
-            retry.push_str(body);
-            trace_rtsp_request(method, self.cseq, headers, body, true);
-            self.rtsp.write_all(retry.as_bytes()).await?;
+            retry.extend_from_slice(b"\r\n");
+            retry.extend_from_slice(body);
+            trace_rtsp_request(
+                method,
+                self.cseq,
+                headers,
+                &String::from_utf8_lossy(body),
+                true,
+            );
+            self.rtsp.write_all(&retry).await?;
             self.cseq += 1;
             let response = read_response(&mut self.rtsp).await?;
             trace_rtsp_response(method, self.cseq - 1, &response);

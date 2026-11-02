@@ -218,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             name = %endpoint.name,
             address = %endpoint.address,
             user_agent = %endpoint.user_agent,
+            auth_setup = endpoint.auth_setup,
             "AirPlay 1 receiver discovered"
         );
     }
@@ -226,6 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map(|endpoint| endpoint.user_agent.clone())
         .unwrap_or_else(|| "iTunes/7.6.2 (Windows; N;)".to_owned());
+    let raop_auth_setup = selected_endpoint
+        .as_ref()
+        .is_some_and(|endpoint| endpoint.auth_setup);
     tracing::info!(
         listen = %file.listen.as_deref().unwrap_or(&args.listen),
         name = %file.name.as_deref().unwrap_or(&args.name),
@@ -247,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             address,
             name: "configured-player".into(),
             user_agent: raop_user_agent.clone(),
+            auth_setup: raop_auth_setup,
         };
         let mut client = RaopClient::connect_with_password(
             &endpoint,
@@ -301,6 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 address,
                 name: "configured-player".into(),
                 user_agent: raop_user_agent.clone(),
+                auth_setup: raop_auth_setup,
             };
             let password = raop_password.clone();
             tokio::spawn(async move {
