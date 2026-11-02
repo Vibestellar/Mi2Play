@@ -97,6 +97,16 @@ pub enum SessionEvent {
     Disconnected,
 }
 
+#[derive(Clone, Debug)]
+pub struct MiPlayControl {
+    tx: mpsc::Sender<SessionControl>,
+}
+
+#[derive(Debug)]
+enum SessionControl {
+    SetVolume(u32),
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("invalid MiPlay frame magic")]
@@ -328,10 +338,13 @@ impl MiPlayServer {
 
     pub async fn accept(&self) -> Result<MiPlaySession, std::io::Error> {
         let (stream, peer) = self.listener.accept().await?;
+        let (control_tx, control_rx) = mpsc::channel(8);
         Ok(MiPlaySession {
             stream,
             peer,
             identity: self.identity.clone(),
+            control_tx,
+            control_rx,
         })
     }
 }
@@ -340,11 +353,19 @@ pub struct MiPlaySession {
     stream: TcpStream,
     peer: SocketAddr,
     identity: DeviceIdentity,
+    control_tx: mpsc::Sender<SessionControl>,
+    control_rx: mpsc::Receiver<SessionControl>,
 }
 
 impl MiPlaySession {
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer
+    }
+
+    pub fn control(&self) -> MiPlayControl {
+        MiPlayControl {
+            tx: self.control_tx.clone(),
+        }
     }
 
     pub async fn run(mut self, events: mpsc::Sender<SessionEvent>) -> Result<(), ProtocolError> {
@@ -372,7 +393,25 @@ impl MiPlaySession {
         .await?;
         tracing::info!("MiPlay device identity announced");
         loop {
-            let frame = match read_frame(&mut self.stream, &mut read_cipher).await {
+            let frame = match tokio::select! {
+                control = self.control_rx.recv() => {
+                    if let Some(SessionControl::SetVolume(value)) = control {
+                        volume = value.min(100);
+                        let notification = write_cipher.encrypt(&volume_notification(volume))?;
+                        write_frame(
+                            &mut self.stream,
+                            0,
+                            NOTIFY,
+                            next_notification_sequence,
+                            &notification,
+                        )
+                        .await?;
+                        next_notification_sequence = next_notification_sequence.wrapping_add(1);
+                    }
+                    continue;
+                }
+                result = read_frame(&mut self.stream, &mut read_cipher) => result
+            } {
                 Ok(frame) => frame,
                 Err(ProtocolError::Io(error))
                     if error.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -715,6 +754,15 @@ impl MiPlaySession {
     }
 }
 
+impl MiPlayControl {
+    pub async fn set_volume(&self, volume: u8) -> Result<(), ()> {
+        self.tx
+            .send(SessionControl::SetVolume(u32::from(volume)))
+            .await
+            .map_err(|_| ())
+    }
+}
+
 fn parse_stream_keys(value: &Value) -> Option<StreamKeys> {
     fn key(value: &Value, name: &str) -> Option<[u8; 16]> {
         let bytes = value.get(name)?.as_str()?.as_bytes();
@@ -864,8 +912,13 @@ async fn receive_rtsp(
             } else if cseq == "3" && message.contains("200") {
                 tracing::info!(%session_id, "MiPlay RTSP media playback started");
                 if let Some(audio) = data.take() {
-                    receive_rtp(audio, keys, events).await?;
-                    return Ok(());
+                    let audio_keys = keys.clone();
+                    let audio_events = events.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = receive_rtp(audio, audio_keys, audio_events).await {
+                            tracing::warn!(%error, "MiPlay RTSP media stream ended");
+                        }
+                    });
                 }
             }
         } else if message.starts_with("OPTIONS") {
@@ -989,8 +1042,13 @@ async fn receive_rtsp(
                 )
                 .await?;
             if let Some(audio) = data.take() {
-                receive_rtp(audio, keys, events).await?;
-                return Ok(());
+                let audio_keys = keys.clone();
+                let audio_events = events.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = receive_rtp(audio, audio_keys, audio_events).await {
+                        tracing::warn!(%error, "MiPlay RTSP media stream ended");
+                    }
+                });
             }
         } else if message.starts_with("PAUSE") {
             control

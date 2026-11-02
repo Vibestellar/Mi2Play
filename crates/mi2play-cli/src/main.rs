@@ -548,6 +548,7 @@ async fn bridge_session(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const RAOP_SAMPLE_RATE: u32 = 44_100;
     let peer = session.peer_addr();
+    let miplay_control = session.control();
     let (events_tx, mut events_rx) = mpsc::channel(32);
     let (connect_tx, mut connect_rx) = mpsc::channel(1);
     tokio::spawn(async move {
@@ -572,6 +573,31 @@ async fn bridge_session(
                             RAOP_SAMPLE_RATE,
                             channels,
                         )?);
+                        if let Some(client) = client.as_mut() {
+                            match client.get_volume().await {
+                                Ok(Some(volume)) => {
+                                    tracing::info!(
+                                        volume,
+                                        "RAOP receiver volume read during MiPlay session setup"
+                                    );
+                                    miplay_control
+                                        .set_volume(volume)
+                                        .await
+                                        .map_err(|_| "MiPlay control channel closed")?;
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(
+                                        "RAOP receiver did not return a volume value"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::debug!(
+                                        %error,
+                                        "RAOP receiver volume query unavailable"
+                                    );
+                                }
+                            }
+                        }
                         if let Some(volume) = pending_volume.take() {
                             if let Some(client) = client.as_mut() {
                                 client.set_volume(RaopClient::volume_db(volume)).await?;

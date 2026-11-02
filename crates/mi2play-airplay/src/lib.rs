@@ -523,11 +523,42 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         Ok(())
     }
 
+    pub async fn get_volume(&mut self) -> Result<Option<u8>, RaopError> {
+        let response = self
+            .request(
+                "GET_PARAMETER",
+                "volume\r\n",
+                &[("Content-Type", "text/parameters")],
+            )
+            .await?;
+        let body = std::str::from_utf8(&response.body).unwrap_or_default();
+        let Some(value) = body.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("volume")
+                .then_some(value.trim())
+        }) else {
+            return Ok(None);
+        };
+        let db = value
+            .parse::<f32>()
+            .map_err(|_| RaopError::InvalidResponse(value.to_owned()))?;
+        Ok(Some(Self::volume_percent(db)))
+    }
+
     pub fn volume_db(volume: u8) -> f32 {
         if volume == 0 {
             -30.0
         } else {
             -30.0 + 30.0 * (volume as f32 / 100.0)
+        }
+    }
+
+    pub fn volume_percent(db: f32) -> u8 {
+        if db <= -30.0 {
+            0
+        } else {
+            ((db / 30.0 + 1.0) * 100.0).round().clamp(0.0, 100.0) as u8
         }
     }
 
