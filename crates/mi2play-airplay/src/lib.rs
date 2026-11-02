@@ -568,8 +568,8 @@ User-Agent: {}\r\nClient-Instance: {}\r\n",
             } else {
                 &self.rtsp_url
             },
-            self.user_agent,
             self.cseq,
+            self.user_agent,
             self.client_instance
         );
         if let Some(session) = &self.negotiated_session {
