@@ -66,6 +66,15 @@ pub fn discover_raop(timeout: Duration) -> Result<Vec<RaopEndpoint>, RaopError> 
                 let endpoint = RaopEndpoint {
                     address: with_ipv6_scope(SocketAddr::new(address.to_ip_addr(), info.port)),
                     name: info.fullname.clone(),
+                    user_agent: info
+                        .get_property_val_str("am")
+                        .filter(|value| {
+                            value.contains("AudioAccessory") || value.contains("AppleTV")
+                        })
+                        .map_or_else(
+                            || "iTunes/7.6.2 (Windows; N;)".to_owned(),
+                            |_| "AirPlay/999.0.0".to_owned(),
+                        ),
                 };
                 if !endpoints.contains(&endpoint) {
                     endpoints.push(endpoint);
@@ -81,6 +90,7 @@ pub fn discover_raop(timeout: Duration) -> Result<Vec<RaopEndpoint>, RaopError> 
 pub struct RaopEndpoint {
     pub address: SocketAddr,
     pub name: String,
+    pub user_agent: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +236,7 @@ pub struct RaopClient {
     session: String,
     negotiated_session: Option<String>,
     rtsp_url: String,
+    user_agent: String,
     cseq: u32,
     ssrc: u32,
     audio: Arc<UdpSocket>,
@@ -291,6 +302,7 @@ impl RaopClient {
         let mut client = Self {
             rtsp,
             rtsp_url: format!("rtsp://{}/{}", endpoint.address.ip(), session),
+            user_agent: endpoint.user_agent.clone(),
             session,
             negotiated_session: None,
             cseq: 1,
@@ -550,12 +562,13 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
     ) -> Result<Response, RaopError> {
         let mut request = format!(
             "{method} {} RTSP/1.0\r\nCSeq: {}\r\n\
-User-Agent: iTunes/7.6.2 (Windows; N;)\r\nClient-Instance: {}\r\n",
+User-Agent: {}\r\nClient-Instance: {}\r\n",
             if method == "OPTIONS" {
                 "*"
             } else {
                 &self.rtsp_url
             },
+            self.user_agent,
             self.cseq,
             self.client_instance
         );
@@ -617,8 +630,8 @@ User-Agent: iTunes/7.6.2 (Windows; N;)\r\nClient-Instance: {}\r\n",
             );
             let mut retry = format!(
                 "{method} {uri} RTSP/1.0\r\nCSeq: {}\r\n\
-User-Agent: iTunes/7.6.2 (Windows; N;)\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
-                self.cseq, self.client_instance
+User-Agent: {}\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
+                self.cseq, self.user_agent, self.client_instance
             );
             if let Some(session) = &self.negotiated_session {
                 retry.push_str(&format!("Session: {session}\r\n"));

@@ -194,29 +194,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let _mi_connect_probe = spawn_mi_connect_probe_listener(file.ipv6.unwrap_or(args.ipv6)).await?;
     let player_filter = file.player_filter.as_ref().unwrap_or(&args.player_filter);
-    let raop_address = if configured_raop.is_some() {
-        configured_raop
+    let discovery_timeout = if configured_raop.is_some() {
+        std::time::Duration::from_secs(2)
     } else {
-        let discovered =
-            tokio::task::spawn_blocking(|| discover_raop(std::time::Duration::from_secs(3)))
-                .await??;
+        std::time::Duration::from_secs(3)
+    };
+    let discovered =
+        tokio::task::spawn_blocking(move || discover_raop(discovery_timeout)).await??;
+    let selected_endpoint = if let Some(address) = configured_raop {
         discovered
             .into_iter()
-            .find(|endpoint| {
-                player_filter.is_empty()
-                    || player_filter
-                        .iter()
-                        .any(|filter| endpoint.name.contains(filter))
-            })
-            .map(|endpoint| {
-                tracing::info!(
-                    name = %endpoint.name,
-                    address = %endpoint.address,
-                    "AirPlay 1 receiver discovered"
-                );
-                endpoint.address
-            })
+            .find(|endpoint| endpoint.address == address)
+    } else {
+        discovered.into_iter().find(|endpoint| {
+            player_filter.is_empty()
+                || player_filter
+                    .iter()
+                    .any(|filter| endpoint.name.contains(filter))
+        })
     };
+    if let Some(endpoint) = &selected_endpoint {
+        tracing::info!(
+            name = %endpoint.name,
+            address = %endpoint.address,
+            user_agent = %endpoint.user_agent,
+            "AirPlay 1 receiver discovered"
+        );
+    }
+    let raop_address = configured_raop.or_else(|| selected_endpoint.as_ref().map(|e| e.address));
+    let raop_user_agent = selected_endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.user_agent.clone())
+        .unwrap_or_else(|| "iTunes/7.6.2 (Windows; N;)".to_owned());
     tracing::info!(
         listen = %file.listen.as_deref().unwrap_or(&args.listen),
         name = %file.name.as_deref().unwrap_or(&args.name),
@@ -237,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = RaopEndpoint {
             address,
             name: "configured-player".into(),
+            user_agent: raop_user_agent.clone(),
         };
         let mut client = RaopClient::connect_with_password(
             &endpoint,
@@ -290,6 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let endpoint = RaopEndpoint {
                 address,
                 name: "configured-player".into(),
+                user_agent: raop_user_agent.clone(),
             };
             let password = raop_password.clone();
             tokio::spawn(async move {
