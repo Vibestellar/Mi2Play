@@ -379,6 +379,7 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         client
             .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
             .await?;
+        client.start_timing_worker();
         let control = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
         let audio = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
         let control_port = control.local_addr()?.port();
@@ -579,17 +580,15 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
                 }
             }
         });
+    }
 
+    fn start_timing_worker(&self) {
         let timing = Arc::clone(&self._timing);
-        let remote_timing = self.remote_timing;
         let running = Arc::clone(&self.running);
         tokio::spawn(async move {
-            if remote_timing.port() == 0 {
-                return;
-            }
             let mut request = [0u8; 32];
             while running.load(Ordering::Relaxed) {
-                let Ok(size) = timing.recv(&mut request).await else {
+                let Ok((size, peer)) = timing.recv_from(&mut request).await else {
                     break;
                 };
                 if size != 32 {
@@ -599,10 +598,10 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
                 response[1] = 0xd3;
                 response[8..16].copy_from_slice(&request[24..32]);
                 let now = ntp_now();
-                tracing::trace!("RAOP RTP timing response");
+                tracing::trace!(%peer, "RAOP RTP timing response");
                 response[16..24].copy_from_slice(&now);
                 response[24..32].copy_from_slice(&now);
-                let _ = timing.send(&response).await;
+                let _ = timing.send_to(&response, peer).await;
             }
         });
     }

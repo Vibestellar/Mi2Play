@@ -18,8 +18,14 @@
 
 - `aircast/src/`：AirPlay 接收端、虚拟设备和 Chromecast 输出。
 - `airupnp/src/`：UPnP/Sonos 发现、媒体控制和 HTTP 音频代理。
+- `airupnp/src/airupnp.c` 的 `HandleRAOP` 将 `RAOP_FLUSH`、`RAOP_STOP`、`RAOP_PLAY` 和 `RAOP_VOLUME` 转换为下游播放器状态；播放时不主动覆盖音量，等待 AirPlay 控制器发送音量事件。
+- `airupnp/src/airupnp.c` 用 `VolumeStampRx/VolumeStampTx` 做约 1 秒的回声抑制，并在下游音量变化后通过 `raopsr_notify(..., RAOP_VOLUME, ...)` 回传归一化的 `0..1` 音量。Mi2Play 可复用这个“单一状态 + 时间戳抑制回环”模型，但不能直接把 UPnP 的整数音量协议当成 MiPlay 的 `uint32_be` 百分比。
+- `aircast/src/castcore.c` 在媒体会话建立或重连后重新发送 `SET_VOLUME`，说明输出会话的创建与音量状态恢复应分离；Mi2Play 的 MiPlay `SET_VOLUME` 也必须先更新本地状态，不能依赖 RAOP `SETUP` 成功。
+- `airupnp/src/airupnp.c` 对 RAOP 的异步回调不阻塞主控制线程；Mi2Play 因此不能在消费 MiPlay 事件的循环中同步等待 RAOP 建链。
 - README 的命令行/配置说明明确了：mDNS UDP 5353、每设备持久 RTSP 端口、播放期间 HTTP/RTP 端口、周期重扫、配置文件覆盖、前台/后台模式和端口范围。
 - 对 Mi2Play 有用的架构模式是“发现器 -> 设备注册表 -> 每设备会话 -> 有界音频管线”，而非其 UPnP/DLNA 具体实现。
+
+本轮按上述证据调整了 Mi2Play：RAOP timing worker 在 `ANNOUNCE` 后、`SETUP` 前启动，并使用未连接 UDP socket 对收到的 timing 请求直接回复；MiPlay 音频首帧触发的 RAOP 连接改为后台任务，控制事件（尤其音量）继续消费，连接完成后再发送有限的待发送音频和最新音量。该改动解决的是已确认的时序/阻塞问题，不等同于真实设备已经接受 `SETUP`；真实 `SETUP 200`、`RECORD 200` 和实际出声仍需设备日志验证。
 
 ### FusionPlay MiPlay SDK
 

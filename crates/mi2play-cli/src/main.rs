@@ -6,7 +6,7 @@ use mi2play_core::DeviceRegistry;
 use mi2play_miplay::{MiPlayServer, SessionEvent};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, net::SocketAddr, path::PathBuf};
@@ -549,35 +549,83 @@ async fn bridge_session(
     const RAOP_SAMPLE_RATE: u32 = 44_100;
     let peer = session.peer_addr();
     let (events_tx, mut events_rx) = mpsc::channel(32);
+    let (connect_tx, mut connect_rx) = mpsc::channel(1);
     tokio::spawn(async move {
         if let Err(error) = session.run(events_tx).await {
             tracing::debug!(%error, %peer, "MiPlay connection closed");
         }
     });
-    let mut client = None;
+    let mut client: Option<RaopClient> = None;
     let mut bridge = None;
-    while let Some(event) = events_rx.recv().await {
-        match event {
-            SessionEvent::Audio(frame) => {
-                if client.is_none() {
-                    tracing::info!(
-                        endpoint = %endpoint.address,
-                        "MiPlay audio received; connecting to RAOP receiver"
-                    );
-                    client = Some(
-                        RaopClient::connect_with_password(
-                            &endpoint,
+    let mut pending_audio = VecDeque::new();
+    let mut pending_volume = None;
+    let mut connecting = false;
+    loop {
+        tokio::select! {
+            result = connect_rx.recv(), if connecting => {
+                connecting = false;
+                match result {
+                    Some(Ok(connected)) => {
+                        client = Some(connected);
+                        bridge = Some(PcmToRaop::new_resampled(
+                            sample_rate,
                             RAOP_SAMPLE_RATE,
                             channels,
-                            password.as_deref(),
-                        )
-                        .await?,
-                    );
-                    bridge = Some(PcmToRaop::new_resampled(
-                        sample_rate,
-                        RAOP_SAMPLE_RATE,
-                        channels,
-                    )?);
+                        )?);
+                        if let Some(volume) = pending_volume.take() {
+                            if let Some(client) = client.as_mut() {
+                                client.set_volume(RaopClient::volume_db(volume)).await?;
+                            }
+                        }
+                        while let Some(frame) = pending_audio.pop_front() {
+                            if let Some(client) = client.as_mut() {
+                                client.send_pcm(
+                                    bridge.as_mut().expect("PCM bridge initialized for audio"),
+                                    frame,
+                                ).await?;
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(%error, "MiPlay-to-RAOP connection failed");
+                    }
+                    None => {}
+                }
+            }
+            event = events_rx.recv() => {
+                let Some(event) = event else { break };
+                match event {
+            SessionEvent::Audio(frame) => {
+                if client.is_none() {
+                    if !connecting {
+                        tracing::info!(
+                            endpoint = %endpoint.address,
+                            "MiPlay audio received; connecting to RAOP receiver"
+                        );
+                        let endpoint = endpoint.clone();
+                        let password = password.clone();
+                        let connect_tx = connect_tx.clone();
+                        connecting = true;
+                        tokio::spawn(async move {
+                            let result = RaopClient::connect_with_password(
+                                &endpoint,
+                                RAOP_SAMPLE_RATE,
+                                channels,
+                                password.as_deref(),
+                            ).await;
+                            let _ = connect_tx.send(result).await;
+                        });
+                    }
+                    if pending_audio.len() < 32 {
+                        pending_audio.push_back(PcmAudioFrame {
+                            sequence: frame.sequence,
+                            timestamp: frame.timestamp,
+                            sample_rate: frame.sample_rate,
+                            channels: frame.channels,
+                            pcm: frame.pcm,
+                        });
+                    }
+                    continue;
                 }
                 tracing::trace!(
                     sequence = frame.sequence,
@@ -633,6 +681,8 @@ async fn bridge_session(
                         );
                         if let Some(client) = client.as_mut() {
                             client.set_volume(RaopClient::volume_db(volume)).await?;
+                        } else {
+                            pending_volume = Some(volume);
                         }
                     } else {
                         tracing::warn!(
@@ -646,6 +696,8 @@ async fn bridge_session(
                 _ => {}
             },
             SessionEvent::Disconnected => break,
+                }
+            }
         }
     }
     if let Some(client) = client {
