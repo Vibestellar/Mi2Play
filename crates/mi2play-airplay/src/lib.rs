@@ -157,8 +157,8 @@ impl PcmToRaop {
             pending: Vec::new(),
             resample_input: Vec::new(),
             resample_phase: 0.0,
-            next_sequence: 0,
-            next_timestamp: 0,
+            next_sequence: rand_seed() as u16,
+            next_timestamp: ntp_timestamp(sample_rate),
         })
     }
 
@@ -263,6 +263,7 @@ pub struct RaopClient {
     running: Arc<AtomicBool>,
     stream_timestamp: Arc<AtomicU32>,
     sample_rate: u32,
+    first_packet: bool,
 }
 
 impl RaopClient {
@@ -296,7 +297,6 @@ impl RaopClient {
         let audio = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
         let control = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
         let timing = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
-        let audio_port = audio.local_addr()?.port();
         let control_port = control.local_addr()?.port();
         let timing_port = timing.local_addr()?.port();
         let session = format!("{:010}", rand_seed());
@@ -332,6 +332,7 @@ impl RaopClient {
             running: Arc::new(AtomicBool::new(true)),
             stream_timestamp: Arc::new(AtomicU32::new(0)),
             sample_rate,
+            first_packet: true,
         };
 
         client.request("OPTIONS", "", &[]).await?;
@@ -382,15 +383,11 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
             .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
             .await?;
         let transport = format!(
-            "RTP/AVP/UDP;unicast;mode=record;timing_port={};control_port={};",
-            timing_port, control_port
+            "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
+            control_port, timing_port
         );
         let response = client
-            .request(
-                "SETUP",
-                "",
-                &[("Transport", &format!("{transport}client_port={audio_port}"))],
-            )
+            .request("SETUP", "", &[("Transport", &transport)])
             .await?;
         let (remote_audio, remote_control, remote_timing) = parse_transport(
             response
@@ -412,7 +409,16 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
             .request(
                 "RECORD",
                 "",
-                &[("Range", "npt=0-"), ("RTP-Info", "seq=0;rtptime=0")],
+                &[
+                    ("Range", "npt=0-"),
+                    (
+                        "RTP-Info",
+                        &format!(
+                            "seq={};rtptime={}",
+                            client.next_sequence, client.next_timestamp
+                        ),
+                    ),
+                ],
             )
             .await?;
         client.start_rtp_workers();
@@ -423,10 +429,21 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         if packet.payload.len() > u16::MAX as usize {
             return Err(RaopError::AudioPayloadTooLarge);
         }
+        if self.first_packet {
+            self.control
+                .send(&build_sync_packet(
+                    self.next_timestamp,
+                    self.sample_rate,
+                    true,
+                ))
+                .await?;
+        }
+        let sequence = self.next_sequence;
+        let timestamp = self.next_timestamp;
         let mut rtp = Vec::with_capacity(RTP_HEADER_LEN + packet.payload.len());
-        rtp.extend_from_slice(&[0x80, 0x60]);
-        rtp.extend_from_slice(&packet.sequence.to_be_bytes());
-        rtp.extend_from_slice(&packet.timestamp.to_be_bytes());
+        rtp.extend_from_slice(&[0x80, if self.first_packet { 0xe0 } else { 0x60 }]);
+        rtp.extend_from_slice(&sequence.to_be_bytes());
+        rtp.extend_from_slice(&timestamp.to_be_bytes());
         rtp.extend_from_slice(&self.ssrc.to_be_bytes());
         let mut payload = packet.payload.clone();
         if self.encrypted {
@@ -434,22 +451,22 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         }
         rtp.extend_from_slice(&payload);
         if let Ok(mut backlog) = self.backlog.lock() {
-            backlog.push_back((packet.sequence, rtp.clone()));
+            backlog.push_back((sequence, rtp.clone()));
             while backlog.len() > 512 {
                 backlog.pop_front();
             }
         }
         tracing::trace!(
-            sequence = packet.sequence,
-            timestamp = packet.timestamp,
+            sequence,
+            timestamp,
             payload_bytes = packet.payload.len(),
             "RAOP RTP audio packet"
         );
         self.audio.send(&rtp).await?;
-        self.next_sequence = packet.sequence.wrapping_add(1);
-        self.next_timestamp = packet.timestamp;
-        self.stream_timestamp
-            .store(packet.timestamp, Ordering::Relaxed);
+        self.first_packet = false;
+        self.next_sequence = sequence.wrapping_add(1);
+        self.next_timestamp = timestamp.wrapping_add(352);
+        self.stream_timestamp.store(timestamp, Ordering::Relaxed);
         Ok(())
     }
 
@@ -986,6 +1003,16 @@ fn ntp_now() -> [u8; 8] {
     result[..4].copy_from_slice(&seconds.to_be_bytes());
     result[4..].copy_from_slice(&fraction.to_be_bytes());
     result
+}
+
+fn ntp_timestamp(sample_rate: u32) -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs() + 2_208_988_800;
+    let fraction = (u64::from(now.subsec_nanos()) << 32) / 1_000_000_000;
+    let ntp = (seconds << 32) | fraction;
+    ((ntp.saturating_mul(u64::from(sample_rate))) >> 32) as u32
 }
 
 fn build_sync_packet(timestamp: u32, sample_rate: u32, first: bool) -> [u8; 20] {

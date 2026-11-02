@@ -612,11 +612,32 @@ async fn bridge_session(
                     }
                 }
                 0x0c => {
-                    if let Some(&volume) = payload.first() {
-                        tracing::debug!(volume, "Applying MiPlay volume to RAOP");
+                    let volume = match payload.as_slice() {
+                        [value] if *value <= 100 => Some(*value),
+                        [0, a, b, c, d] => {
+                            let value = u32::from_be_bytes([*a, *b, *c, *d]);
+                            (value <= 100).then_some(value as u8)
+                        }
+                        [a, b, c, d] => {
+                            let value = u32::from_be_bytes([*a, *b, *c, *d]);
+                            (value <= 100).then_some(value as u8)
+                        }
+                        _ => None,
+                    };
+                    if let Some(volume) = volume {
+                        tracing::debug!(
+                            volume,
+                            payload_bytes = payload.len(),
+                            "Applying MiPlay volume to RAOP"
+                        );
                         if let Some(client) = client.as_mut() {
                             client.set_volume(RaopClient::volume_db(volume)).await?;
                         }
+                    } else {
+                        tracing::warn!(
+                            payload_bytes = payload.len(),
+                            "Ignoring invalid MiPlay volume payload"
+                        );
                     }
                 }
                 0x08 => break,
