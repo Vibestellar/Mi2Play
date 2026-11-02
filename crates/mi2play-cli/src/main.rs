@@ -612,6 +612,7 @@ async fn bridge_session(
                     }
                 }
                 0x0c => {
+                    tracing::debug!(payload = ?payload, "MiPlay volume command payload");
                     let volume = match payload.as_slice() {
                         [value] if *value <= 100 => Some(*value),
                         [0, a, b, c, d] => {

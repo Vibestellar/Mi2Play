@@ -361,6 +361,7 @@ impl MiPlaySession {
         let mut pending_auth: Option<(u16, Vec<u8>)> = None;
         let mut stream_keys = None;
         let mut volume = 50u32;
+        let mut next_notification_sequence = 8u16;
         write_frame(
             &mut self.stream,
             0,
@@ -638,10 +639,11 @@ impl MiPlaySession {
                             &mut self.stream,
                             0,
                             NOTIFY,
-                            frame.sequence.wrapping_add(1),
+                            next_notification_sequence,
                             &notification,
                         )
                         .await?;
+                        next_notification_sequence = next_notification_sequence.wrapping_add(1);
                     }
                 }
                 (0, SET_MEDIA_INFO) | (0, GET_MEDIA_INFO) => {

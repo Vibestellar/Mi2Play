@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -301,7 +301,7 @@ impl RaopClient {
         let mut aes_iv = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut aes_key);
         rand::thread_rng().fill_bytes(&mut aes_iv);
-        let client_instance = format!("{:016x}", rand_seed() as u64);
+        let client_instance = format!("{:016x}", rand::random::<u64>());
         let mut client = Self {
             rtsp,
             rtsp_url: format!("rtsp://{}/{}", endpoint.address.ip(), session),
@@ -656,13 +656,7 @@ User-Agent: {}\r\nClient-Instance: {}\r\n",
         }
         request.extend_from_slice(b"\r\n");
         request.extend_from_slice(body);
-        trace_rtsp_request(
-            method,
-            self.cseq,
-            headers,
-            &String::from_utf8_lossy(body),
-            false,
-        );
+        trace_rtsp_request(method, self.cseq, headers, body, false);
         self.rtsp.write_all(&request).await?;
         self.cseq += 1;
         let response = read_response(&mut self.rtsp).await?;
@@ -720,13 +714,7 @@ User-Agent: {}\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
             }
             retry.extend_from_slice(b"\r\n");
             retry.extend_from_slice(body);
-            trace_rtsp_request(
-                method,
-                self.cseq,
-                headers,
-                &String::from_utf8_lossy(body),
-                true,
-            );
+            trace_rtsp_request(method, self.cseq, headers, body, true);
             self.rtsp.write_all(&retry).await?;
             self.cseq += 1;
             let response = read_response(&mut self.rtsp).await?;
@@ -826,7 +814,7 @@ fn trace_rtsp_request(
     method: &str,
     cseq: u32,
     headers: &[(&str, &str)],
-    body: &str,
+    body: &[u8],
     authenticated: bool,
 ) {
     let headers = headers
@@ -873,7 +861,10 @@ fn redact_rtsp_value(name: &str, value: &str) -> String {
     }
 }
 
-fn summarize_rtsp_body(body: &str) -> String {
+fn summarize_rtsp_body(body: &[u8]) -> String {
+    let Ok(body) = std::str::from_utf8(body) else {
+        return summarize_rtsp_bytes(body);
+    };
     if body.contains("rsaaeskey:") || body.contains("aesiv:") {
         return body
             .lines()
@@ -893,14 +884,30 @@ fn summarize_rtsp_body(body: &str) -> String {
 }
 
 fn summarize_rtsp_bytes(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let text = text.trim();
-    if text.is_empty() {
+    if body.is_empty() {
         "<empty>".into()
-    } else if text.len() > 512 {
-        format!("{}…", text.chars().take(512).collect::<String>())
+    } else if body
+        .iter()
+        .all(|byte| matches!(byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e))
+    {
+        let text = String::from_utf8_lossy(body);
+        let text = text.trim();
+        if text.len() > 512 {
+            format!("{}…", text.chars().take(512).collect::<String>())
+        } else {
+            text.to_owned()
+        }
     } else {
-        text.to_owned()
+        let shown = body
+            .iter()
+            .take(96)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if body.len() > 96 {
+            format!("<binary {} bytes hex={}…>", body.len(), shown)
+        } else {
+            format!("<binary {} bytes hex={shown}>", body.len())
+        }
     }
 }
 
@@ -976,17 +983,16 @@ fn with_ipv6_scope(address: SocketAddr) -> SocketAddr {
 
 fn local_bind_addr(address: SocketAddr, remote: SocketAddr) -> SocketAddr {
     match address {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V4(address) => SocketAddr::new(IpAddr::V4(*address.ip()), 0),
         SocketAddr::V6(address) => {
             let scope = if address.scope_id() != 0 {
                 address.scope_id()
+            } else if let SocketAddr::V6(remote) = remote {
+                remote.scope_id()
             } else {
-                match remote {
-                    SocketAddr::V6(remote) => remote.scope_id(),
-                    SocketAddr::V4(_) => 0,
-                }
+                0
             };
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, scope))
+            SocketAddr::V6(SocketAddrV6::new(*address.ip(), 0, 0, scope))
         }
     }
 }
