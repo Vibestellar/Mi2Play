@@ -560,22 +560,7 @@ async fn bridge_session(
     let mut bridge = None;
     let mut pending_audio = VecDeque::new();
     let mut pending_volume = None;
-    let mut connecting = true;
-    {
-        let endpoint = endpoint.clone();
-        let password = password.clone();
-        let connect_tx = connect_tx.clone();
-        tokio::spawn(async move {
-            let result = RaopClient::connect_with_password(
-                &endpoint,
-                RAOP_SAMPLE_RATE,
-                channels,
-                password.as_deref(),
-            )
-            .await;
-            let _ = connect_tx.send(result).await;
-        });
-    }
+    let mut connecting = false;
     loop {
         tokio::select! {
             result = connect_rx.recv(), if connecting => {
@@ -629,7 +614,6 @@ async fn bridge_session(
                     }
                     Some(Err(error)) => {
                         tracing::warn!(%error, "MiPlay-to-RAOP connection failed");
-                        let _ = miplay_control.set_volume(50).await;
                     }
                     None => {}
                 }
@@ -637,6 +621,28 @@ async fn bridge_session(
             event = events_rx.recv() => {
                 let Some(event) = event else { break };
                 match event {
+            SessionEvent::PlaybackRequested => {
+                if client.is_none() && !connecting {
+                    tracing::info!(
+                        endpoint = %endpoint.address,
+                        "MiPlay playback requested; connecting to RAOP receiver"
+                    );
+                    let endpoint = endpoint.clone();
+                    let password = password.clone();
+                    let connect_tx = connect_tx.clone();
+                    connecting = true;
+                    tokio::spawn(async move {
+                        let result = RaopClient::connect_with_password(
+                            &endpoint,
+                            RAOP_SAMPLE_RATE,
+                            channels,
+                            password.as_deref(),
+                        )
+                        .await;
+                        let _ = connect_tx.send(result).await;
+                    });
+                }
+            }
             SessionEvent::Audio(frame) => {
                 if client.is_none() {
                     if !connecting {

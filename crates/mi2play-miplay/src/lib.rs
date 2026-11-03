@@ -6,7 +6,10 @@ use md5::{Digest, Md5};
 use rand::RngCore;
 use serde_json::Value;
 use sha2::Sha256;
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -93,6 +96,7 @@ pub struct PcmAudioFrame {
 #[derive(Debug)]
 pub enum SessionEvent {
     Audio(PcmAudioFrame),
+    PlaybackRequested,
     Command { command: u16, payload: Vec<u8> },
     Stopped,
     Disconnected,
@@ -384,6 +388,7 @@ impl MiPlaySession {
         let mut stream_keys = None;
         let mut volume = None;
         let mut pending_volume_requests = Vec::new();
+        let mut volume_deadline = None;
         let mut next_notification_sequence = 8u16;
         write_frame(
             &mut self.stream,
@@ -395,6 +400,12 @@ impl MiPlaySession {
         .await?;
         tracing::info!("MiPlay device identity announced");
         loop {
+            let volume_timeout = tokio::time::sleep_until(
+                volume_deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400))
+                    .into(),
+            );
+            tokio::pin!(volume_timeout);
             let frame = match tokio::select! {
                 control = self.control_rx.recv() => {
                     if let Some(SessionControl::SetVolume(value)) = control {
@@ -425,6 +436,26 @@ impl MiPlaySession {
                         .await?;
                         next_notification_sequence = next_notification_sequence.wrapping_add(1);
                     }
+                    continue;
+                }
+                _ = &mut volume_timeout, if !pending_volume_requests.is_empty() => {
+                    volume = Some(50);
+                    for sequence in pending_volume_requests.drain(..) {
+                        let mut response = Vec::with_capacity(5);
+                        response.push(0);
+                        response.extend_from_slice(&50u32.to_be_bytes());
+                        let encrypted = write_cipher.encrypt(&response)?;
+                        write_frame(
+                            &mut self.stream,
+                            0,
+                            GET_VOLUME_ACK,
+                            sequence,
+                            &encrypted,
+                        )
+                        .await?;
+                    }
+                    volume_deadline = None;
+                    tracing::debug!("Returning fallback MiPlay volume after RAOP query timeout");
                     continue;
                 }
                 result = read_frame(&mut self.stream, &mut read_cipher) => result
@@ -623,6 +654,7 @@ impl MiPlaySession {
                         .await?;
                     } else {
                         pending_volume_requests.push(frame.sequence);
+                        volume_deadline.get_or_insert(Instant::now() + Duration::from_secs(3));
                         tracing::debug!(
                             sequence = frame.sequence,
                             "Deferring MiPlay volume response until output volume is known"
@@ -676,6 +708,7 @@ impl MiPlaySession {
                     });
                     let encrypted = write_cipher.encrypt(&[0, 0, 0, 0, 0])?;
                     write_frame(&mut self.stream, 0, OPEN_ACK, frame.sequence, &encrypted).await?;
+                    let _ = events.send(SessionEvent::PlaybackRequested).await;
                 }
                 (0, PAUSE) => {
                     let encrypted = write_cipher.encrypt(&[])?;
