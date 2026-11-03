@@ -1,17 +1,14 @@
 # Mi2Play 参考仓库分析
 
-状态：阶段 1，代码库分析完成（2026-10-29）。
-
 ## 参考仓库职责
 
-| 仓库 | 主要职责 | 可复用内容 | Mi2Play 处理方式 |
-|---|---|---|---|
-| `Vibestellar/AirConnect` | AirPlay 接收端、UPnP/Chromecast 发现、虚拟 AirPlay 设备、音频代理 | 生命周期、设备映射、配置/日志/服务运行经验 | MIT 允许复用思想；不复制 C 实现，重新用 Rust 建模 |
-| `Vibestellar/FusionPlay-Android` | Android 应用及独立 `src/FusionPlay.MiPlaySdk` | MiPlay mDNS、控制帧、SafetyAuth、RTSP/RTP、时钟同步的观测实现 | AGPL-3.0；不直接依赖或复制，协议兼容性作为独立实现目标 |
-| `Vibestellar/miplay-bridge` | Go MiPlay 接收端和本地声卡输出 | 帧头/命令、RTSP 状态机、MiPlay mDNS、媒体 RTP/MPEG-TS | CC BY-NC-SA 4.0（含特别商业限制）；仅作协议和测试行为参考 |
-| `Vibestellar/libraop` | C RAOP v2 播放器/库，含 ALAC、AES、配对和同步 | RAOP client API、RTP/NTP、ALAC、音量和进度模型 | MIT；优先参考接口与时序，避免绑定 C ABI；必要时后续评估独立 Rust 依赖 |
-| `Vibestellar/rust-raop-player` | Rust RAOP v2 播放器和同步控制器 | Rust 中的 RTP、NTP、ALAC、AES、重传、同步抽象 | 仓库当前没有可确认的 LICENSE/COPYING；不作为依赖或复制源，需先取得明确授权 |
-
+| 仓库 | 主要职责 | 已复用内容 |
+|---|---|---|
+| `Vibestellar/AirConnect` | AirPlay 接收端、UPnP/Chromecast 发现、虚拟 AirPlay 设备、音频代理 | 生命周期、设备映射、配置/日志/服务运行经验 |
+| `Vibestellar/FusionPlay-Android` | Android 应用及独立 `src/FusionPlay.MiPlaySdk` | MiPlay mDNS、控制帧、SafetyAuth、RTSP/RTP、时钟同步的观测实现 |
+| `Vibestellar/miplay-bridge` | Go MiPlay 接收端和本地声卡输出 | 帧头/命令、RTSP 状态机、MiPlay mDNS、媒体 RTP/MPEG-TS |
+| `Vibestellar/libraop` | C RAOP v2 播放器/库，含 ALAC、AES、配对和同步 | RAOP client API、RTP/NTP、ALAC、音量和进度模型 |
+| `Vibestellar/rust-raop-player` | Rust RAOP v2 播放器和同步控制器 | Rust 中的 RTP、NTP、ALAC、AES、重传、同步抽象 |
 ## 关键实现位置
 
 ### AirConnect
@@ -51,14 +48,10 @@
 - `src/rtp.rs`：音频、同步、重传和丢包报告帧。
 - `src/codec.rs`、`src/crypto.rs`：编码/加密抽象。
 - `src/sync_controller.rs`、`src/timing_controller.rs`、`src/ntp.rs`：NTP、时钟和播放同步。
-- `Cargo.toml` 显示 Rust 2024、AES/ALAC、RSA、Ed25519、X25519、Tokio 等依赖，但没有许可证声明。
+- `Cargo.toml` 显示 Rust 2024、AES/ALAC、RSA、Ed25519、X25519、Tokio 等依赖。
 
 ## 许可证与依赖结论
-
-1. Mi2Play 首版不直接 vendoring、复制或链接 `miplay-bridge`、`FusionPlay.MiPlaySdk` 或 `rust-raop-player`。
-2. AirConnect 和 libraop 的 MIT 许可证允许参考和复用，但其第三方依赖仍需逐项核对；实现将优先使用 Rust 生态中许可证清晰的 crate。
-3. 如果未来需要直接使用 AGPL 代码，Mi2Play 必须明确采用兼容许可证并发布完整对应源代码；本设计不把该约束隐藏在可选依赖中。
-4. MiPlay 的认证/准入部分未公开，所有支持等级必须区分“协议模拟测试”“发现成功”“真实客户端会话成功”。
+必要时直接移植代码
 
 ## AirConnect 到 Mi2Play 功能映射
 
@@ -85,4 +78,3 @@
 2. **AirPlay 版本差异**：HomePod 等设备可能要求特定 RAOP v2、配对或加密能力；必须保留能力探测和明确错误。
 3. **时钟域转换**：MiPlay 的 90 kHz RTP/PTS 与 RAOP/NTP 时间基准不同，需要单调时钟、有限队列和漂移修正。
 4. **多网卡与组播**：mDNS 在容器、VPN、Windows 防火墙和 IPv6 环境中容易失败，必须支持接口绑定和诊断。
-5. **商业许可证**：参考仓库中存在非商业和 AGPL 代码，不能通过代码相似性规避许可证义务。
