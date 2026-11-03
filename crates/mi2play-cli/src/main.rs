@@ -1,7 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::{Parser, ValueEnum};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use mi2play_airplay::{PcmAudioFrame, PcmToRaop, RaopClient, RaopEndpoint, discover_raop};
+use mi2play_airplay::{
+    PcmAudioFrame, PcmToRaop, RaopClient, RaopEndpoint, RaopError, discover_raop,
+};
 use mi2play_core::DeviceRegistry;
 use mi2play_miplay::{MiPlayServer, SessionEvent};
 use serde::Deserialize;
@@ -550,7 +552,7 @@ async fn bridge_session(
     let peer = session.peer_addr();
     let miplay_control = session.control();
     let (events_tx, mut events_rx) = mpsc::channel(32);
-    let (connect_tx, mut connect_rx) = mpsc::channel(1);
+    let (connect_tx, mut connect_rx) = mpsc::channel::<Result<RaopClient, RaopError>>(1);
     tokio::spawn(async move {
         if let Err(error) = session.run(events_tx).await {
             tracing::debug!(%error, %peer, "MiPlay connection closed");
@@ -561,54 +563,60 @@ async fn bridge_session(
     let mut pending_audio = VecDeque::new();
     let mut pending_volume = None;
     let mut connecting = false;
+    let mut playback_active = false;
     loop {
         tokio::select! {
             result = connect_rx.recv(), if connecting => {
                 connecting = false;
                 match result {
                     Some(Ok(connected)) => {
-                        client = Some(connected);
-                        bridge = Some(PcmToRaop::new_resampled(
-                            sample_rate,
-                            RAOP_SAMPLE_RATE,
-                            channels,
-                        )?);
-                        if let Some(client) = client.as_mut() {
-                            match client.get_volume().await {
-                                Ok(Some(volume)) => {
-                                    tracing::info!(
-                                        volume,
-                                        "RAOP receiver volume read during MiPlay session setup"
-                                    );
-                                    miplay_control
-                                        .set_volume(volume)
-                                        .await
-                                        .map_err(|_| "MiPlay control channel closed")?;
-                                }
-                                Ok(None) => {
-                                    tracing::debug!(
-                                        "RAOP receiver did not return a volume value"
-                                    );
-                                }
-                                Err(error) => {
-                                    tracing::debug!(
-                                        %error,
-                                        "RAOP receiver volume query unavailable"
-                                    );
+                        if !playback_active {
+                            let connected = connected;
+                            connected.stop().await?;
+                        } else {
+                            client = Some(connected);
+                            bridge = Some(PcmToRaop::new_resampled(
+                                sample_rate,
+                                RAOP_SAMPLE_RATE,
+                                channels,
+                            )?);
+                            if let Some(client) = client.as_mut() {
+                                match client.get_volume().await {
+                                    Ok(Some(volume)) => {
+                                        tracing::info!(
+                                            volume,
+                                            "RAOP receiver volume read during MiPlay session setup"
+                                        );
+                                        miplay_control
+                                            .set_volume(volume)
+                                            .await
+                                            .map_err(|_| "MiPlay control channel closed")?;
+                                    }
+                                    Ok(None) => {
+                                        tracing::debug!(
+                                            "RAOP receiver did not return a volume value"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            %error,
+                                            "RAOP receiver volume query unavailable"
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        if let Some(volume) = pending_volume.take() {
-                            if let Some(client) = client.as_mut() {
-                                client.set_volume(RaopClient::volume_db(volume)).await?;
+                            if let Some(volume) = pending_volume.take() {
+                                if let Some(client) = client.as_mut() {
+                                    client.set_volume(RaopClient::volume_db(volume)).await?;
+                                }
                             }
-                        }
-                        while let Some(frame) = pending_audio.pop_front() {
-                            if let Some(client) = client.as_mut() {
-                                client.send_pcm(
-                                    bridge.as_mut().expect("PCM bridge initialized for audio"),
-                                    frame,
-                                ).await?;
+                            while let Some(frame) = pending_audio.pop_front() {
+                                if let Some(client) = client.as_mut() {
+                                    client.send_pcm(
+                                        bridge.as_mut().expect("PCM bridge initialized for audio"),
+                                        frame,
+                                    ).await?;
+                                }
                             }
                         }
                     }
@@ -622,6 +630,7 @@ async fn bridge_session(
                 let Some(event) = event else { break };
                 match event {
             SessionEvent::PlaybackRequested => {
+                playback_active = true;
                 if client.is_none() && !connecting {
                     tracing::info!(
                         endpoint = %endpoint.address,
@@ -697,8 +706,13 @@ async fn bridge_session(
                     .await?;
             }
             SessionEvent::Stopped => {
-            tracing::info!("MiPlay playback stopped; tearing down RAOP session");
-            break;
+            playback_active = false;
+            pending_audio.clear();
+            pending_volume = None;
+            if let Some(client) = client.take() {
+                tracing::info!("MiPlay playback stopped; tearing down RAOP session");
+                client.stop().await?;
+            }
             }
             SessionEvent::Command { command, payload } => match command & 0xff {
                 0x04 => {
@@ -744,7 +758,15 @@ async fn bridge_session(
                         );
                     }
                 }
-                0x08 => break,
+                0x08 => {
+                    playback_active = false;
+                    pending_audio.clear();
+                    pending_volume = None;
+                    if let Some(client) = client.take() {
+                        tracing::info!("MiPlay stop command; tearing down RAOP session");
+                        client.stop().await?;
+                    }
+                }
                 _ => {}
             },
             SessionEvent::Disconnected => break,
