@@ -560,7 +560,22 @@ async fn bridge_session(
     let mut bridge = None;
     let mut pending_audio = VecDeque::new();
     let mut pending_volume = None;
-    let mut connecting = false;
+    let mut connecting = true;
+    {
+        let endpoint = endpoint.clone();
+        let password = password.clone();
+        let connect_tx = connect_tx.clone();
+        tokio::spawn(async move {
+            let result = RaopClient::connect_with_password(
+                &endpoint,
+                RAOP_SAMPLE_RATE,
+                channels,
+                password.as_deref(),
+            )
+            .await;
+            let _ = connect_tx.send(result).await;
+        });
+    }
     loop {
         tokio::select! {
             result = connect_rx.recv(), if connecting => {
@@ -614,6 +629,7 @@ async fn bridge_session(
                     }
                     Some(Err(error)) => {
                         tracing::warn!(%error, "MiPlay-to-RAOP connection failed");
+                        let _ = miplay_control.set_volume(50).await;
                     }
                     None => {}
                 }
@@ -673,6 +689,10 @@ async fn bridge_session(
                         },
                     )
                     .await?;
+            }
+            SessionEvent::Stopped => {
+            tracing::info!("MiPlay playback stopped; tearing down RAOP session");
+            break;
             }
             SessionEvent::Command { command, payload } => match command & 0xff {
                 0x04 => {

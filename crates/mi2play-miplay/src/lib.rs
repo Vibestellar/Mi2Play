@@ -94,6 +94,7 @@ pub struct PcmAudioFrame {
 pub enum SessionEvent {
     Audio(PcmAudioFrame),
     Command { command: u16, payload: Vec<u8> },
+    Stopped,
     Disconnected,
 }
 
@@ -381,7 +382,8 @@ impl MiPlaySession {
         let own_challenge = hex::encode(own_challenge);
         let mut pending_auth: Option<(u16, Vec<u8>)> = None;
         let mut stream_keys = None;
-        let mut volume = 50u32;
+        let mut volume = None;
+        let mut pending_volume_requests = Vec::new();
         let mut next_notification_sequence = 8u16;
         write_frame(
             &mut self.stream,
@@ -396,8 +398,23 @@ impl MiPlaySession {
             let frame = match tokio::select! {
                 control = self.control_rx.recv() => {
                     if let Some(SessionControl::SetVolume(value)) = control {
-                        volume = value.min(100);
-                        let notification = write_cipher.encrypt(&volume_notification(volume))?;
+                        volume = Some(value.min(100));
+                        for sequence in pending_volume_requests.drain(..) {
+                            let mut response = Vec::with_capacity(5);
+                            response.push(0);
+                            response.extend_from_slice(&value.min(100).to_be_bytes());
+                            let encrypted = write_cipher.encrypt(&response)?;
+                            write_frame(
+                                &mut self.stream,
+                                0,
+                                GET_VOLUME_ACK,
+                                sequence,
+                                &encrypted,
+                            )
+                            .await?;
+                        }
+                        let notification =
+                            write_cipher.encrypt(&volume_notification(value.min(100)))?;
                         write_frame(
                             &mut self.stream,
                             0,
@@ -591,18 +608,26 @@ impl MiPlaySession {
                     .await?;
                 }
                 (0, GET_VOLUME) => {
-                    let mut response = Vec::with_capacity(5);
-                    response.push(0);
-                    response.extend_from_slice(&volume.to_be_bytes());
-                    let encrypted = write_cipher.encrypt(&response)?;
-                    write_frame(
-                        &mut self.stream,
-                        0,
-                        GET_VOLUME_ACK,
-                        frame.sequence,
-                        &encrypted,
-                    )
-                    .await?;
+                    if let Some(volume) = volume {
+                        let mut response = Vec::with_capacity(5);
+                        response.push(0);
+                        response.extend_from_slice(&volume.to_be_bytes());
+                        let encrypted = write_cipher.encrypt(&response)?;
+                        write_frame(
+                            &mut self.stream,
+                            0,
+                            GET_VOLUME_ACK,
+                            frame.sequence,
+                            &encrypted,
+                        )
+                        .await?;
+                    } else {
+                        pending_volume_requests.push(frame.sequence);
+                        tracing::debug!(
+                            sequence = frame.sequence,
+                            "Deferring MiPlay volume response until output volume is known"
+                        );
+                    }
                 }
                 (0, HEARTBEAT) => {
                     let encrypted = write_cipher.encrypt(&[])?;
@@ -672,8 +697,8 @@ impl MiPlaySession {
                     )
                     .await?;
                     if let Some(value) = decode_volume_percent(&frame.body) {
-                        volume = value;
-                        let notification = write_cipher.encrypt(&volume_notification(volume))?;
+                        volume = Some(value);
+                        let notification = write_cipher.encrypt(&volume_notification(value))?;
                         write_frame(
                             &mut self.stream,
                             0,
@@ -914,9 +939,11 @@ async fn receive_rtsp(
                 if let Some(audio) = data.take() {
                     let audio_keys = keys.clone();
                     let audio_events = events.clone();
+                    let stop_events = events.clone();
                     tokio::spawn(async move {
                         if let Err(error) = receive_rtp(audio, audio_keys, audio_events).await {
                             tracing::warn!(%error, "MiPlay RTSP media stream ended");
+                            let _ = stop_events.send(SessionEvent::Stopped).await;
                         }
                     });
                 }
@@ -1014,6 +1041,13 @@ async fn receive_rtsp(
                     .as_bytes(),
                 )
                 .await?;
+            if message
+                .to_ascii_lowercase()
+                .contains("wfd_trigger_method: teardown")
+            {
+                let _ = events.send(SessionEvent::Stopped).await;
+                return Ok(());
+            }
             if message.contains("wfd_trigger_method: SETUP") {
                 let (image_port, audio_port) = data_ports.ok_or(ProtocolError::InvalidRtsp)?;
                 control
@@ -1044,12 +1078,28 @@ async fn receive_rtsp(
             if let Some(audio) = data.take() {
                 let audio_keys = keys.clone();
                 let audio_events = events.clone();
+                let stop_events = events.clone();
                 tokio::spawn(async move {
                     if let Err(error) = receive_rtp(audio, audio_keys, audio_events).await {
                         tracing::warn!(%error, "MiPlay RTSP media stream ended");
+                        let _ = stop_events.send(SessionEvent::Stopped).await;
                     }
                 });
             }
+        } else if message.starts_with("TEARDOWN") {
+            control
+                .write_all(
+                    format!(
+                        "RTSP/1.0 200 OK\r\n\
+                         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+                         CSeq: {cseq}\r\n\
+                         Content-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            let _ = events.send(SessionEvent::Stopped).await;
+            return Ok(());
         } else if message.starts_with("PAUSE") {
             control
                 .write_all(
