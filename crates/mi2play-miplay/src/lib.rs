@@ -654,7 +654,6 @@ impl MiPlaySession {
                         .await?;
                     } else {
                         pending_volume_requests.push(frame.sequence);
-                        volume_deadline.get_or_insert(Instant::now() + Duration::from_secs(3));
                         tracing::debug!(
                             sequence = frame.sequence,
                             "Deferring MiPlay volume response until output volume is known"
@@ -708,6 +707,9 @@ impl MiPlaySession {
                     });
                     let encrypted = write_cipher.encrypt(&[0, 0, 0, 0, 0])?;
                     write_frame(&mut self.stream, 0, OPEN_ACK, frame.sequence, &encrypted).await?;
+                    if !pending_volume_requests.is_empty() {
+                        volume_deadline = Some(Instant::now() + Duration::from_secs(3));
+                    }
                     let _ = events.send(SessionEvent::PlaybackRequested).await;
                 }
                 (0, PAUSE) => {
