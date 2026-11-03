@@ -1070,14 +1070,10 @@ fn build_sync_packet(timestamp: u32, sample_rate: u32, first: bool) -> [u8; 20] 
     packet[0] = if first { 0x90 } else { 0x80 };
     packet[1] = 0xd4;
     packet[2..4].copy_from_slice(&7u16.to_be_bytes());
-    let ntp = if sample_rate == 0 {
-        0
-    } else {
-        (u64::from(timestamp) << 32) / u64::from(sample_rate)
-    };
-    packet[4..12].copy_from_slice(&ntp.to_be_bytes());
+    let _ = sample_rate;
+    packet[4..12].copy_from_slice(&u64::from_be_bytes(ntp_now()).to_be_bytes());
     packet[12..16].copy_from_slice(&timestamp.to_be_bytes());
-    packet[16..20].copy_from_slice(&0u32.to_be_bytes());
+    packet[16..20].copy_from_slice(&timestamp.wrapping_sub(11_025).to_be_bytes());
     packet
 }
 
@@ -1204,5 +1200,9 @@ mod tests {
         let packet = build_sync_packet(48_000, 48_000, false);
         assert_eq!(&packet[..4], &[0x80, 0xd4, 0, 7]);
         assert_eq!(&packet[12..16], &48_000u32.to_be_bytes());
+        assert_eq!(
+            &packet[16..20],
+            &48_000u32.wrapping_sub(11_025).to_be_bytes()
+        );
     }
 }
