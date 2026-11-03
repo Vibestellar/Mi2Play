@@ -158,7 +158,7 @@ impl PcmToRaop {
             resample_input: Vec::new(),
             resample_phase: 0.0,
             next_sequence: rand_seed() as u16,
-            next_timestamp: ntp_timestamp(sample_rate),
+            next_timestamp: rand_seed(),
         })
     }
 
@@ -253,6 +253,7 @@ pub struct RaopClient {
     remote_timing: SocketAddr,
     next_sequence: u16,
     next_timestamp: u32,
+    ntp_base: u64,
     aes_key: [u8; 16],
     aes_iv: [u8; 16],
     client_instance: String,
@@ -302,6 +303,7 @@ impl RaopClient {
         rand::thread_rng().fill_bytes(&mut aes_key);
         rand::thread_rng().fill_bytes(&mut aes_iv);
         let client_instance = format!("{:016x}", rand::random::<u64>());
+        let initial_timestamp = rand_seed();
         let mut client = Self {
             rtsp,
             rtsp_url: format!("rtsp://{}/{}", endpoint.address.ip(), session),
@@ -318,7 +320,9 @@ impl RaopClient {
             remote_control: SocketAddr::new(endpoint.address.ip(), 0),
             remote_timing: SocketAddr::new(endpoint.address.ip(), 0),
             next_sequence: rand_seed() as u16,
-            next_timestamp: ntp_timestamp(sample_rate),
+            next_timestamp: initial_timestamp,
+            ntp_base: ntp_now_u64()
+                .wrapping_sub((u64::from(initial_timestamp) << 32) / u64::from(sample_rate)),
             aes_key,
             aes_iv,
             client_instance,
@@ -440,6 +444,7 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
                 .expect("RAOP control socket initialized")
                 .send(&build_sync_packet(
                     self.next_timestamp,
+                    self.ntp_base,
                     self.sample_rate,
                     true,
                 ))
@@ -578,6 +583,7 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         let running = Arc::clone(&self.running);
         let stream_timestamp = Arc::clone(&self.stream_timestamp);
         let sample_rate = self.sample_rate;
+        let ntp_base = self.ntp_base;
         tokio::spawn(async move {
             let mut buffer = [0u8; 64];
             let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
@@ -606,7 +612,12 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
                     _ = sync_interval.tick() => {
                         let timestamp = stream_timestamp.load(Ordering::Relaxed);
                         tracing::trace!(timestamp, "RAOP RTP sync packet");
-                        let _ = control.send(&build_sync_packet(timestamp, sample_rate, false)).await;
+                        let _ = control.send(&build_sync_packet(
+                            timestamp,
+                            ntp_base,
+                            sample_rate,
+                            false,
+                        )).await;
                     }
                 }
             }
@@ -1055,23 +1066,17 @@ fn ntp_now() -> [u8; 8] {
     result
 }
 
-fn ntp_timestamp(sample_rate: u32) -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds = now.as_secs() + 2_208_988_800;
-    let fraction = (u64::from(now.subsec_nanos()) << 32) / 1_000_000_000;
-    let ntp = (seconds << 32) | fraction;
-    ((ntp.saturating_mul(u64::from(sample_rate))) >> 32) as u32
+fn ntp_now_u64() -> u64 {
+    u64::from_be_bytes(ntp_now())
 }
 
-fn build_sync_packet(timestamp: u32, sample_rate: u32, first: bool) -> [u8; 20] {
+fn build_sync_packet(timestamp: u32, ntp_base: u64, sample_rate: u32, first: bool) -> [u8; 20] {
     let mut packet = [0u8; 20];
     packet[0] = if first { 0x90 } else { 0x80 };
     packet[1] = 0xd4;
     packet[2..4].copy_from_slice(&7u16.to_be_bytes());
-    let _ = sample_rate;
-    packet[4..12].copy_from_slice(&u64::from_be_bytes(ntp_now()).to_be_bytes());
+    let ntp = ntp_base.wrapping_add((u64::from(timestamp) << 32) / u64::from(sample_rate));
+    packet[4..12].copy_from_slice(&ntp.to_be_bytes());
     packet[12..16].copy_from_slice(&timestamp.to_be_bytes());
     packet[16..20].copy_from_slice(&timestamp.wrapping_sub(11_025).to_be_bytes());
     packet
@@ -1197,7 +1202,7 @@ mod tests {
 
     #[test]
     fn builds_periodic_sync_packet() {
-        let packet = build_sync_packet(48_000, 48_000, false);
+        let packet = build_sync_packet(48_000, 0, 48_000, false);
         assert_eq!(&packet[..4], &[0x80, 0xd4, 0, 7]);
         assert_eq!(&packet[12..16], &48_000u32.to_be_bytes());
         assert_eq!(
