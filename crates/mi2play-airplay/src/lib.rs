@@ -504,6 +504,9 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         bridge: &mut PcmToRaop,
         frame: PcmAudioFrame,
     ) -> Result<usize, RaopError> {
+        if !self.recording {
+            return Ok(0);
+        }
         let packets = bridge.push(frame)?;
         let count = packets.len();
         for packet in packets {

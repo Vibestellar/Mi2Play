@@ -328,3 +328,4 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 - 后续常规反馈使用 `RUST_LOG=mi2play=debug,mi2play_miplay=debug,mi2play_airplay=debug`；一次联调只在需要逐包定位时短时启用 `trace`。
 - 修正 `PcmToRaop` 不再用 MiPlay 音频帧中的零值 sequence/timestamp 覆盖 RAOP 自有 RTP 时间线。该问题有代码证据，但尚未有新的真实设备日志证明已经恢复出声。
 - 最新日志显示 MiPlay 在同一段播放中反复发送 `command=6`，旧实现会为每次命令重复发送 `RECORD Range: npt=0-`；已改为仅在暂停后第一次恢复时发送 `RECORD`，并增加每 100 个音频 RTP 包一次的 debug 汇总，避免逐包反馈。
+- 2026-11-03 13:45 实机日志包含两轮播放/暂停：首轮从约 13:45:07 持续发送 RTP，13:45:36 收到两次暂停并完成两次 `FLUSH 200`；但发送统计仍从约 3600 增长到 5300，说明暂停后仍在发送音频。第二轮恢复后又继续发送到 10000 包，音响仍无声。已让 `send_pcm` 在 RAOP 暂停状态直接丢弃 MiPlay 音频帧，避免 `FLUSH` 后继续发送 RTP；该修复尚待下一次实机验证。
