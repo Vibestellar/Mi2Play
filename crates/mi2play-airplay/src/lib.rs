@@ -146,7 +146,7 @@ impl PcmToRaop {
             });
         }
         let output = FormatDescription::alac(sample_rate as f64, 352, channels as u32);
-        let input = FormatDescription::pcm::<i16>(sample_rate as f64, channels as u32);
+        let input = FormatDescription::pcm::<i16>(input_sample_rate as f64, channels as u32);
         Ok(Self {
             encoder: AlacEncoder::new(&output),
             input,
@@ -261,6 +261,9 @@ pub struct RaopClient {
     stream_timestamp: Arc<AtomicU32>,
     sample_rate: u32,
     first_packet: bool,
+    recording: bool,
+    audio_packet_count: u64,
+    audio_payload_bytes: u64,
 }
 
 impl RaopClient {
@@ -330,6 +333,9 @@ impl RaopClient {
             stream_timestamp: Arc::new(AtomicU32::new(0)),
             sample_rate,
             first_packet: true,
+            recording: true,
+            audio_packet_count: 0,
+            audio_payload_bytes: 0,
         };
 
         client.request("OPTIONS", "", &[]).await?;
@@ -479,6 +485,17 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         self.next_sequence = sequence.wrapping_add(1);
         self.next_timestamp = timestamp.wrapping_add(352);
         self.stream_timestamp.store(timestamp, Ordering::Relaxed);
+        self.audio_packet_count += 1;
+        self.audio_payload_bytes += packet.payload.len() as u64;
+        if self.audio_packet_count % 100 == 0 {
+            tracing::debug!(
+                packets = self.audio_packet_count,
+                payload_bytes = self.audio_payload_bytes,
+                sequence,
+                timestamp,
+                "RAOP audio transmission progress"
+            );
+        }
         Ok(())
     }
 
@@ -505,11 +522,16 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
             )],
         )
         .await?;
+        self.recording = false;
         Ok(())
     }
 
     pub async fn resume(&mut self) -> Result<(), RaopError> {
+        if self.recording {
+            return Ok(());
+        }
         self.request("RECORD", "", &[("Range", "npt=0-")]).await?;
+        self.recording = true;
         Ok(())
     }
 
