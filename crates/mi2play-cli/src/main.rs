@@ -685,8 +685,6 @@ async fn bridge_session(
                     continue;
                 }
                 tracing::trace!(
-                    sequence = frame.sequence,
-                    timestamp = frame.timestamp,
                     pcm_bytes = frame.pcm.len(),
                     "Bridging MiPlay PCM to RAOP"
                 );

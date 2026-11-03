@@ -173,10 +173,6 @@ impl PcmToRaop {
         if frame.pcm.len() % bytes_per_sample != 0 {
             return Err(RaopError::InvalidPcmLength(frame.pcm.len()));
         }
-        if self.pending.is_empty() && self.resample_input.is_empty() {
-            self.next_sequence = frame.sequence;
-            self.next_timestamp = frame.timestamp;
-        }
         if self.input_sample_rate == self.sample_rate {
             self.pending.extend_from_slice(&frame.pcm);
         } else {
@@ -1135,8 +1131,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0].sequence, 10);
-        assert_eq!(packets[0].timestamp, 100);
+        assert_eq!(packets[0].sequence.wrapping_add(1), bridge.next_sequence);
+        assert_eq!(
+            packets[0].timestamp.wrapping_add(352),
+            bridge.next_timestamp
+        );
         assert!(!packets[0].payload.is_empty());
     }
 

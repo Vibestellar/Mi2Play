@@ -945,7 +945,7 @@ async fn receive_rtsp(
         let message = read_rtsp(&mut control, &mut input).await?;
         let cseq = header(&message, "cseq").unwrap_or("0").to_string();
         let start_line = message.lines().next().unwrap_or_default();
-        tracing::debug!(start_line, cseq, "MiPlay RTSP message received");
+        tracing::trace!(start_line, cseq, "MiPlay RTSP message received");
         if message.starts_with("RTSP/1.0") {
             if cseq == "2" && message.contains("200") {
                 session_id = header(&message, "session")

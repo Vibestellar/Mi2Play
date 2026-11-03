@@ -281,7 +281,7 @@ RTP first timestamp
 ## 10. 推荐下一步
 
 1. 在 `cd761ec` 上做真实测试：扫描但不播放、播放、切回本机、再次切回 Mi2Play、暂停/恢复、快速重复切换。
-2. 用 `RUST_LOG=mi2play=debug,mi2play_miplay=debug,mi2play_airplay=debug` 保存完整日志；避免长时间 `trace`，除非需要定位 RTP。
+2. 反馈日志默认使用 `RUST_LOG=mi2play=debug,mi2play_miplay=debug,mi2play_airplay=debug`；不要长时间使用 `trace`。`trace` 仅在需要逐包核对 RTP/RTSP 时短时间开启，并限制在一次播放会话。
 3. 若第二次切换仍失败，先加 session id / playback generation 日志，不要猜命令号。
 4. 给 `MiPlaySession` 和 `bridge_session` 增加播放 generation 或 cancellation token，防止旧 RTSP/RTP task 的迟到 `Stopped` 关闭新播放。
 5. 对重复 `Stopped` 做 generation 过滤；当前媒体 EOF、RTSP teardown 和控制事件可能对同一播放产生多个停止通知。
@@ -318,3 +318,12 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 再检查当前 HEAD 和工作区。以真实日志为证据继续 MiPlay -> RAOP 工作，
 不要重复已经完成的协议调查，也不要把猜测写成已验证事实。
 ```
+
+## 13. 2026-11-03 最新无声反馈后的日志与时间线调整
+
+用户反馈：最新完整会话仍然无声音，并指出长时间 `trace` 日志浪费反馈 token。
+
+- 真实日志仍只证明 MiPlay PCM 解码、RAOP 建链和 RTP 发送成功，不能证明音响实际渲染音频。
+- 将 MiPlay RTSP 每条消息日志从 `debug` 降为 `trace`；逐 RTP 包、timing 和完整 RTSP 正文继续只在 `trace` 下输出。
+- 后续常规反馈使用 `RUST_LOG=mi2play=debug,mi2play_miplay=debug,mi2play_airplay=debug`；一次联调只在需要逐包定位时短时启用 `trace`。
+- 修正 `PcmToRaop` 不再用 MiPlay 音频帧中的零值 sequence/timestamp 覆盖 RAOP 自有 RTP 时间线。该问题有代码证据，但尚未有新的真实设备日志证明已经恢复出声。
