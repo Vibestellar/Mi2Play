@@ -2,7 +2,7 @@
 
 > 更新时间：2026-11-03  
 > 当前分支：`feat/airplay1-miplay-bridge`  
-> 当前 HEAD：`cd761ec`  
+> 当前 HEAD：`4be22e3`（交接文档提交；代码行为基线为 `cd761ec`）
 > 用途：为新 Agent 提供可恢复的技术上下文。阅读本文件后，再查看当前代码和最新真实设备日志；不要把“代码编译通过”误写成“真实设备已验证”。
 
 ## 1. 项目目标
@@ -99,7 +99,25 @@ Mi2Play 接收手机的真实 MiPlay 会话，并把音频转发到真实 AirPla
 
 参考源码只能证明协议实现的候选形状；真实设备 `200 OK`、实际音频和切换日志才是设备兼容性的证据。
 
-## 6. 每次提交记录
+## 6. 提交判断审计说明
+
+上一版交接文档的提交判断**不够可靠**：它主要把 `git log`、当前代码和压缩摘要拼在一起，没有逐条核对当时的真实设备日志，因此把“后续阶段已经能继续”误写成“该提交已经解决”。本节及下表按会话 checkpoint 和用户日志重新收紧结论。
+
+特别需要记住：
+
+- `cargo check/test` 只能证明代码和模拟测试，不证明手机或音响接受了该协议。
+- 后续提交成功，不能证明前一个提交解决了问题；很多提交只是把失败从一个协议阶段推进到下一个阶段。
+- `365d22c` 的 RSA v1.5 修改与 `libraop`/`rust-raop-player` 的 OAEP 参考相冲突，不能标为成功修复。
+- `e9cd3f8`、`8c6f6e6` 之后真实日志仍有 `SETUP 500`；真正出现 `SETUP 200` 是后续 socket/timing/调度修改之后，不能把前两个提交单独算作解决。
+- `b2d0762` 解决了控制面被媒体接收阻塞的一部分问题，但没有解决媒体结束到 RAOP teardown 的传播；当时用户日志明确显示 sync 持续到 Ctrl+C。
+- `c459350` 增加了停止传播和未知音量模型，但也引入/暴露了“MiPlay TCP 会话一建立就提前 RAOP 建链”的错误行为；用户扫描日志明确证明该版本不可接受。
+- `9f8a7b2` 只解决扫描阶段不建立 RAOP，不能代表音量闭环或重连闭环已解决。
+- `0d88f2d` 的超时起点代码修复尚未由真实设备 UI 证明；后续用户日志仍需要检查是否使用了包含该提交的二进制。
+- `cd761ec` 只是针对“停止后桥接循环退出、第二次 OPEN 无消费者”的代码修复；截至文档生成时没有最新真实日志证明重复切换已经稳定。
+
+因此，下表的“判断性质”是**截至对应提交的证据边界**，不是对整个后续历史的回溯性背书。
+
+## 7. 每次提交记录
 
 状态标签：
 
@@ -137,25 +155,39 @@ Mi2Play 接收手机的真实 MiPlay 会话，并把音频转发到真实 AirPla
 | `b865073` | 发送兼容 RAOP ANNOUNCE headers。 | 为真实音响接受 ANNOUNCE 铺路。 | 部分解决/真实验证 |
 | `27f172a` | 增加详细 RAOP RTSP tracing。 | 直接暴露请求/响应时序，帮助定位后续 403/500。 | 已解决诊断问题 |
 | `68735e8` | 将 MiPlay PCM 重采样到 RAOP 44.1 kHz。 | 音响可接收标准 RAOP 采样率；真实 RTP 音频日志确认。 | 已解决/真实验证 |
-| `365d22c` | 使用 RAOP RSA v1.5 key encryption。 | 对齐部分参考客户端；是 ANNOUNCE/auth 兼容性修复的一部分。 | 部分解决/真实验证 |
+| `365d22c` | 使用 RAOP RSA v1.5 key encryption。 | 后续核对 `libraop` 和 `rust-raop-player` 均使用 OAEP；该改动没有被真实设备单独证明，后来被 OAEP 方向替代。 | 未解决/错误方向猜测 |
 | `188b2de` | 对齐 RAOP SDP 和远端地址。 | 修正 ANNOUNCE 内容；为 200 OK 做准备。 | 已解决/真实验证 |
 | `54ef25d` | 对齐 RAOP URL、sid、User-Agent 和 session 时序。 | ANNOUNCE 从 403 走向成功；真实日志确认。 | 已解决/真实验证 |
 | `1eb51c4` | 默认使用 clear RAOP audio negotiation。 | 避免错误地协商音频加密；真实音频 RTP 成功。 | 已解决/真实验证 |
 | `b84de25` | 根据 mDNS `am` 选择 RAOP User-Agent。 | 提升不同 AirPlay 设备兼容性；真实设备继续接受。 | 部分解决/真实验证 |
 | `7fc095c` | 保持 RAOP request header ordering。 | 修正严格设备解析差异；无单独隔离证据，但后续 SETUP 成功。 | 部分解决/真实验证 |
 | `4f7e653` | 当 mDNS `et=4` 时执行 X25519 `/auth-setup`。 | 真实音响 `/auth-setup` 返回 200/1076 bytes。 | 已解决/真实验证 |
-| `e9cd3f8` | 对齐 RAOP SETUP 和 playback state。 | 为 SETUP 500 修复铺路；后续仍需 socket 时序修复。 | 部分解决 |
-| `8c6f6e6` | 完善 RAOP SETUP 和 MiPlay 音量控制。 | MiPlay 音量多档调整、ACK/NOTIFY 基本工作；SETUP 仍曾失败。 | 部分解决/真实验证 |
-| `3c5a45b` | 绑定 RAOP sockets 到本机地址并改善 trace。 | 解决部分 SETUP 失败；真实日志随后出现 SETUP 200。 | 已解决/真实验证 |
-| `cdd4fd9` | 修正 timing 时序和 MiPlay bridge 调度。 | timing response、SETUP/RECORD、音频发送成功；避免控制面被音频接收阻塞。 | 已解决/真实验证 |
-| `b2d0762` | 保持 MiPlay RTSP 控制面活跃，增加 RAOP 音量查询同步。 | `GET_PARAMETER volume` 成功，早期 `early eof` 问题明显改善；初始音量仍会先返回旧默认值。 | 部分解决/真实验证 |
+| `e9cd3f8` | 对齐 RAOP SETUP 和 playback state。 | 真实设备仍返回 `SETUP 500`；只是协议形状尝试，没有单独解决。 | 未解决/猜测性修复 |
+| `8c6f6e6` | 完善 RAOP SETUP 和 MiPlay 音量控制。 | 音量协议代码增加，但真实设备仍有 SETUP 失败，手机音量仍出现少数档位/初始中间值；不能称为解决。 | 未解决/部分代码验证 |
+| `3c5a45b` | 绑定 RAOP sockets 到本机地址并改善 trace。 | 与后续 timing/调度修改共同推进到 `SETUP 200`；无法仅凭后续日志证明本提交单独解决。 | 部分解决/因果未隔离 |
+| `cdd4fd9` | 修正 timing 时序和 MiPlay bridge 调度。 | 之后真实日志出现 `SETUP 200`、`RECORD 200` 和 RTP；这一阶段解决了建链/控制阻塞问题，但后续 teardown、初始音量和重连仍失败。 | 部分解决/真实验证 |
+| `b2d0762` | 保持 MiPlay RTSP 控制面活跃，增加 RAOP 音量查询同步。 | 音量查询真实成功；但用户日志中媒体结束后 RAOP sync 仍持续到 Ctrl+C，teardown 缺口未解决。 | 部分解决/明确未完成 |
 | `9597f61` | 修正文档中的仓库职责和许可证描述。 | 只影响 `docs/reference-analysis.md`，不改变运行行为。 | 文档验证 |
-| `c459350` | 用未知音量 + 挂起 GET_VOLUME、媒体停止事件触发 RAOP teardown。 | 修复了音量状态模型和停止传播的主要缺口；但后来发现 RAOP 在扫描阶段提前连接。 | 部分解决/真实验证 |
-| `9f8a7b2` | 将 RAOP 连接门控到加密 MiPlay `OPEN`。 | 扫描日志不再出现 RAOP；正式播放收到 `OPEN` 后才连接。 | 已解决/真实验证 |
-| `0d88f2d` | 将 3 秒音量 fallback 从 GET_VOLUME 时刻延后到 `OPEN` 时刻。 | 扫描阶段不再提前返回 50；正式播放后等待真实 RAOP 音量。 | 已解决代码时序/待真实 UI 验证 |
-| `cd761ec` | 停止播放只 teardown 当前 RAOP，保留 MiPlay bridge/control loop。 | 修复第一次切回后第二次 `OPEN` 无消费者的问题；编译测试通过，重复真实切换尚待验证。 | 部分解决/代码验证 |
+| `c459350` | 用未知音量 + 挂起 GET_VOLUME、媒体停止事件触发 RAOP teardown。 | 代码引入了停止事件和音量挂起，但真实日志随后证明扫描阶段仍提前建立 RAOP；该版本行为不可接受。 | 部分解决且引入新问题/真实反证 |
+| `9f8a7b2` | 将 RAOP 连接门控到加密 MiPlay `OPEN`。 | 用户日志确认扫描阶段不再出现 RAOP，正式播放阶段出现；只解决扫描误连接，不解决音量 fallback 或重连。 | 已解决单一问题/真实验证 |
+| `0d88f2d` | 将 3 秒音量 fallback 从 GET_VOLUME 时刻延后到 `OPEN` 时刻。 | 代码意图正确，但真实 UI 尚未证明；此前用户日志明确显示 50 fallback 早于 OPEN，必须确认运行二进制包含本提交。 | 代码修复/真实结果未确认 |
+| `cd761ec` | 停止播放只 teardown 当前 RAOP，保留 MiPlay bridge/control loop。 | 针对日志中“第一次停止后第二次 OPEN 无消费者”的根因修复；仅编译测试通过，重复真实切换尚未证明。 | 未完成真实验证 |
 
-## 7. 重要真实日志证据
+## 8. 已知未解决或曾失败的修改
+
+这些不是“历史细节”，而是新 Agent 不得重复宣称已解决的事项：
+
+| 问题 | 相关提交/阶段 | 真实证据 | 当前结论 |
+|---|---|---|---|
+| RAOP `SETUP 500` | `e9cd3f8`、`8c6f6e6` 及更早尝试 | 音响返回 `500 Internal Server Error`，没有 `Session`/远端端口，也没有 `RECORD` | 后续 `cdd4fd9` 阶段才出现 200；因果不能归给单个早期提交 |
+| 音量只有少数档位/初始跳到 50 | 早期音量实现、`8c6f6e6`、`b2d0762`、`c459350` | 用户多次报告手机显示中间值后跳真实值；`GET_VOLUME` 曾返回硬编码 50 | 只有协议格式和挂起机制部分完成，真实 UI 闭环仍需验证 |
+| 扫描就让音响显示 AirPlay | `c459350` | 用户提供日志：认证后、没有 `OPEN`/PCM 时已经出现 RAOP `OPTIONS→RECORD` | `9f8a7b2` 已修复该单一问题 |
+| 媒体结束不 teardown RAOP | `b2d0762` 之前/当时 | `early eof` 后 RAOP sync 持续到 Ctrl+C 才 `TEARDOWN` | 后续 `c459350` 增加事件，但生命周期仍需真实验证 |
+| 第一次切回后再次切换失败 | `c459350`、`cd761ec` | 第一次停止后桥接任务退出；下一次 `OPEN` 没有 RAOP 日志 | `cd761ec` 只完成代码修复，尚无重复切换实测证据 |
+| `early eof`/`broken pipe` | 多个媒体停止阶段 | 手机关闭媒体 TCP 后出现 `early eof`；某次下一轮播放出现 `broken pipe/truncated` | `early eof` 本身可能是正常媒体收尾；`broken pipe` 暴露旧桥接生命周期问题，不能统称“已解决” |
+| RSA v1.5 方向 | `365d22c` | 两个指定参考项目使用 OAEP；没有真实成功证据支持 v1.5 | 应视为被后续参考核对否定的尝试 |
+
+## 9. 重要真实日志证据
 
 ### 扫描不应建立 RAOP
 
@@ -205,7 +237,7 @@ broken pipe / truncated MiPlay frame
 - 第二次 `OPEN` 是否在旧 connect task 尚未完成时到达；
 - 是否出现第二个 RAOP `OPTIONS`。
 
-## 8. 推荐下一步
+## 10. 推荐下一步
 
 1. 在 `cd761ec` 上做真实测试：扫描但不播放、播放、切回本机、再次切回 Mi2Play、暂停/恢复、快速重复切换。
 2. 用 `RUST_LOG=mi2play=debug,mi2play_miplay=debug,mi2play_airplay=debug` 保存完整日志；避免长时间 `trace`，除非需要定位 RTP。
@@ -220,7 +252,7 @@ broken pipe / truncated MiPlay frame
    - 旧媒体 task 的停止事件不能关闭新 RAOP session。
 7. 真实验证通过后再更新 README 的“真实设备集成测试”描述；不要只凭单元测试修改兼容性声明。
 
-## 9. 验证命令
+## 11. 验证命令
 
 ```sh
 cargo fmt --all -- --check
@@ -236,7 +268,7 @@ git status --short --branch
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 ```
 
-## 10. 新 Agent 启动指令
+## 12. 新 Agent 启动指令
 
 新会话开始时使用：
 
@@ -245,4 +277,3 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 再检查当前 HEAD 和工作区。以真实日志为证据继续 MiPlay -> RAOP 工作，
 不要重复已经完成的协议调查，也不要把猜测写成已验证事实。
 ```
-
