@@ -416,6 +416,7 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         if remote_timing.port() != 0 {
             client._timing.connect(remote_timing).await?;
         }
+        client.rebase_audio_clock();
         client
             .request(
                 "RECORD",
@@ -533,9 +534,25 @@ m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14
         if self.recording {
             return Ok(());
         }
-        self.request("RECORD", "", &[("Range", "npt=0-")]).await?;
+        self.rebase_audio_clock();
+        let rtp_info = format!("seq={};rtptime={}", self.next_sequence, self.next_timestamp);
+        self.request(
+            "RECORD",
+            "",
+            &[("Range", "npt=0-"), ("RTP-Info", &rtp_info)],
+        )
+        .await?;
         self.recording = true;
         Ok(())
+    }
+
+    fn rebase_audio_clock(&mut self) {
+        let now = ntp_now_u64();
+        let timestamp = (now.wrapping_mul(u64::from(self.sample_rate)) >> 32) as u32;
+        self.next_timestamp = timestamp;
+        self.ntp_base =
+            now.wrapping_sub((u64::from(timestamp) << 32) / u64::from(self.sample_rate));
+        self.stream_timestamp.store(timestamp, Ordering::Relaxed);
     }
 
     pub async fn set_volume(&mut self, volume: f32) -> Result<(), RaopError> {
