@@ -564,6 +564,7 @@ async fn bridge_session(
     let mut pending_volume = None;
     let mut connecting = false;
     let mut playback_active = false;
+    let mut paused = false;
     loop {
         tokio::select! {
             result = connect_rx.recv(), if connecting => {
@@ -610,12 +611,19 @@ async fn bridge_session(
                                     client.set_volume(RaopClient::volume_db(volume)).await?;
                                 }
                             }
-                            while let Some(frame) = pending_audio.pop_front() {
+                            if paused {
+                                pending_audio.clear();
                                 if let Some(client) = client.as_mut() {
-                                    client.send_pcm(
-                                        bridge.as_mut().expect("PCM bridge initialized for audio"),
-                                        frame,
-                                    ).await?;
+                                    client.pause().await?;
+                                }
+                            } else {
+                                while let Some(frame) = pending_audio.pop_front() {
+                                    if let Some(client) = client.as_mut() {
+                                        client.send_pcm(
+                                            bridge.as_mut().expect("PCM bridge initialized for audio"),
+                                            frame,
+                                        ).await?;
+                                    }
                                 }
                             }
                         }
@@ -653,6 +661,9 @@ async fn bridge_session(
                 }
             }
             SessionEvent::Audio(frame) => {
+                if !playback_active || paused {
+                    continue;
+                }
                 if client.is_none() {
                     if !connecting {
                         tracing::info!(
@@ -705,6 +716,7 @@ async fn bridge_session(
             }
             SessionEvent::Stopped => {
             playback_active = false;
+            paused = false;
             pending_audio.clear();
             pending_volume = None;
             if let Some(client) = client.take() {
@@ -714,13 +726,20 @@ async fn bridge_session(
             }
             SessionEvent::Command { command, payload } => match command & 0xff {
                 0x04 => {
-                    if let Some(client) = client.as_mut() {
-                        client.pause().await?;
+                    if !paused {
+                        paused = true;
+                        pending_audio.clear();
+                        if let Some(client) = client.as_mut() {
+                            client.pause().await?;
+                        }
                     }
                 }
                 0x06 => {
-                    if let Some(client) = client.as_mut() {
-                        client.resume().await?;
+                    if paused {
+                        paused = false;
+                        if let Some(client) = client.as_mut() {
+                            client.resume().await?;
+                        }
                     }
                 }
                 0x0c => {
