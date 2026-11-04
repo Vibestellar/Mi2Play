@@ -1,25 +1,28 @@
 # Mi2Play 参考仓库分析
 
-状态：阶段 1，代码库分析完成（2026-10-29）。
-
 ## 参考仓库职责
 
-| 仓库 | 主要职责 | 可复用内容 | Mi2Play 处理方式 |
-|---|---|---|---|
-| `Vibestellar/AirConnect` | AirPlay 接收端、UPnP/Chromecast 发现、虚拟 AirPlay 设备、音频代理 | 生命周期、设备映射、配置/日志/服务运行经验 | MIT 允许复用思想；不复制 C 实现，重新用 Rust 建模 |
-| `Vibestellar/FusionPlay-Android` | Android 应用及独立 `src/FusionPlay.MiPlaySdk` | MiPlay mDNS、控制帧、SafetyAuth、RTSP/RTP、时钟同步的观测实现 | AGPL-3.0；不直接依赖或复制，协议兼容性作为独立实现目标 |
-| `Vibestellar/miplay-bridge` | Go MiPlay 接收端和本地声卡输出 | 帧头/命令、RTSP 状态机、MiPlay mDNS、媒体 RTP/MPEG-TS | CC BY-NC-SA 4.0（含特别商业限制）；仅作协议和测试行为参考 |
-| `Vibestellar/libraop` | C RAOP v2 播放器/库，含 ALAC、AES、配对和同步 | RAOP client API、RTP/NTP、ALAC、音量和进度模型 | MIT；优先参考接口与时序，避免绑定 C ABI；必要时后续评估独立 Rust 依赖 |
-| `Vibestellar/rust-raop-player` | Rust RAOP v2 播放器和同步控制器 | Rust 中的 RTP、NTP、ALAC、AES、重传、同步抽象 | 仓库当前没有可确认的 LICENSE/COPYING；不作为依赖或复制源，需先取得明确授权 |
-
+| 仓库 | 主要职责 | 可复用内容 |
+|---|---|---|
+| `Vibestellar/AirConnect` | AirPlay 接收端、UPnP/Chromecast 发现、虚拟 AirPlay 设备、音频代理 | 生命周期、设备映射、配置/日志/服务运行经验 |
+| `Vibestellar/FusionPlay-Android` | Android 应用及独立 `src/FusionPlay.MiPlaySdk` | MiPlay mDNS、控制帧、SafetyAuth、RTSP/RTP、时钟同步的观测实现 |
+| `Vibestellar/miplay-bridge` | Go MiPlay 接收端和本地声卡输出 | 帧头/命令、RTSP 状态机、MiPlay mDNS、媒体 RTP/MPEG-TS |
+| `Vibestellar/libraop` | C RAOP v2 播放器/库，含 ALAC、AES、配对和同步 | RAOP client API、RTP/NTP、ALAC、音量和进度模型 |
+| `Vibestellar/rust-raop-player` | Rust RAOP v2 播放器和同步控制器 | Rust 中的 RTP、NTP、ALAC、AES、重传、同步抽象 |
 ## 关键实现位置
 
 ### AirConnect
 
 - `aircast/src/`：AirPlay 接收端、虚拟设备和 Chromecast 输出。
 - `airupnp/src/`：UPnP/Sonos 发现、媒体控制和 HTTP 音频代理。
+- `airupnp/src/airupnp.c` 的 `HandleRAOP` 将 `RAOP_FLUSH`、`RAOP_STOP`、`RAOP_PLAY` 和 `RAOP_VOLUME` 转换为下游播放器状态；播放时不主动覆盖音量，等待 AirPlay 控制器发送音量事件。
+- `airupnp/src/airupnp.c` 用 `VolumeStampRx/VolumeStampTx` 做约 1 秒的回声抑制，并在下游音量变化后通过 `raopsr_notify(..., RAOP_VOLUME, ...)` 回传归一化的 `0..1` 音量。Mi2Play 可复用这个“单一状态 + 时间戳抑制回环”模型，但不能直接把 UPnP 的整数音量协议当成 MiPlay 的 `uint32_be` 百分比。
+- `aircast/src/castcore.c` 在媒体会话建立或重连后重新发送 `SET_VOLUME`，说明输出会话的创建与音量状态恢复应分离；Mi2Play 的 MiPlay `SET_VOLUME` 也必须先更新本地状态，不能依赖 RAOP `SETUP` 成功。
+- `airupnp/src/airupnp.c` 对 RAOP 的异步回调不阻塞主控制线程；Mi2Play 因此不能在消费 MiPlay 事件的循环中同步等待 RAOP 建链。
 - README 的命令行/配置说明明确了：mDNS UDP 5353、每设备持久 RTSP 端口、播放期间 HTTP/RTP 端口、周期重扫、配置文件覆盖、前台/后台模式和端口范围。
 - 对 Mi2Play 有用的架构模式是“发现器 -> 设备注册表 -> 每设备会话 -> 有界音频管线”，而非其 UPnP/DLNA 具体实现。
+
+本轮按上述证据调整了 Mi2Play：RAOP timing worker 在 `ANNOUNCE` 后、`SETUP` 前启动，并使用未连接 UDP socket 对收到的 timing 请求直接回复；MiPlay 音频首帧触发的 RAOP 连接改为后台任务，控制事件（尤其音量）继续消费，连接完成后再发送有限的待发送音频和最新音量。该改动解决的是已确认的时序/阻塞问题，不等同于真实设备已经接受 `SETUP`；真实 `SETUP 200`、`RECORD 200` 和实际出声仍需设备日志验证。
 
 ### FusionPlay MiPlay SDK
 
@@ -51,14 +54,10 @@
 - `src/rtp.rs`：音频、同步、重传和丢包报告帧。
 - `src/codec.rs`、`src/crypto.rs`：编码/加密抽象。
 - `src/sync_controller.rs`、`src/timing_controller.rs`、`src/ntp.rs`：NTP、时钟和播放同步。
-- `Cargo.toml` 显示 Rust 2024、AES/ALAC、RSA、Ed25519、X25519、Tokio 等依赖，但没有许可证声明。
+- `Cargo.toml` 显示 Rust 2024、AES/ALAC、RSA、Ed25519、X25519、Tokio 等依赖。
 
 ## 许可证与依赖结论
-
-1. Mi2Play 首版不直接 vendoring、复制或链接 `miplay-bridge`、`FusionPlay.MiPlaySdk` 或 `rust-raop-player`。
-2. AirConnect 和 libraop 的 MIT 许可证允许参考和复用，但其第三方依赖仍需逐项核对；实现将优先使用 Rust 生态中许可证清晰的 crate。
-3. 如果未来需要直接使用 AGPL 代码，Mi2Play 必须明确采用兼容许可证并发布完整对应源代码；本设计不把该约束隐藏在可选依赖中。
-4. MiPlay 的认证/准入部分未公开，所有支持等级必须区分“协议模拟测试”“发现成功”“真实客户端会话成功”。
+必要时可移植成为目标代码
 
 ## AirConnect 到 Mi2Play 功能映射
 
@@ -85,4 +84,3 @@
 2. **AirPlay 版本差异**：HomePod 等设备可能要求特定 RAOP v2、配对或加密能力；必须保留能力探测和明确错误。
 3. **时钟域转换**：MiPlay 的 90 kHz RTP/PTS 与 RAOP/NTP 时间基准不同，需要单调时钟、有限队列和漂移修正。
 4. **多网卡与组播**：mDNS 在容器、VPN、Windows 防火墙和 IPv6 环境中容易失败，必须支持接口绑定和诊断。
-5. **商业许可证**：参考仓库中存在非商业和 AGPL 代码，不能通过代码相似性规避许可证义务。

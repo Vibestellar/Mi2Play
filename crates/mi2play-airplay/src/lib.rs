@@ -1,0 +1,1254 @@
+use std::{
+    collections::VecDeque,
+    net::{IpAddr, SocketAddr, SocketAddrV6},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
+    time::{Duration, UNIX_EPOCH},
+};
+
+use aes::{
+    Aes128,
+    cipher::{BlockEncrypt, KeyInit},
+};
+use alac_encoder::{AlacEncoder, FormatDescription};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use md5::{Digest, Md5};
+use rand::RngCore;
+use rsa::{Oaep, RsaPublicKey};
+use sha1::Sha1;
+use thiserror::Error;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+};
+use x25519_dalek::{PublicKey, StaticSecret};
+
+const RTP_HEADER_LEN: usize = 12;
+type RtpBacklog = Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>;
+
+#[derive(Debug, Error)]
+pub enum RaopError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid RTSP response: {0}")]
+    InvalidResponse(String),
+    #[error("RAOP request failed with status {status}: {reason}")]
+    RequestFailed { status: u16, reason: String },
+    #[error("RAOP response is missing {0} header")]
+    MissingHeader(&'static str),
+    #[error("audio payload is too large for one RTP packet")]
+    AudioPayloadTooLarge,
+    #[error("unsupported audio format: {sample_rate} Hz, {channels} channels")]
+    UnsupportedAudioFormat { sample_rate: u32, channels: u8 },
+    #[error("PCM payload length {0} is not aligned to the sample format")]
+    InvalidPcmLength(usize),
+    #[error("RAOP encryption setup failed: {0}")]
+    Crypto(String),
+    #[error("mDNS discovery failed: {0}")]
+    Discovery(String),
+}
+
+pub fn discover_raop(timeout: Duration) -> Result<Vec<RaopEndpoint>, RaopError> {
+    let daemon =
+        mdns_sd::ServiceDaemon::new().map_err(|error| RaopError::Discovery(error.to_string()))?;
+    let events = daemon
+        .browse("_raop._tcp.local.")
+        .map_err(|error| RaopError::Discovery(error.to_string()))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut endpoints = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let Ok(event) = events.recv_timeout(remaining) else {
+            break;
+        };
+        if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+            for address in &info.addresses {
+                let endpoint = RaopEndpoint {
+                    address: with_ipv6_scope(SocketAddr::new(address.to_ip_addr(), info.port)),
+                    name: info.fullname.clone(),
+                    user_agent: info
+                        .get_property_val_str("am")
+                        .filter(|value| {
+                            value.contains("AudioAccessory") || value.contains("AppleTV")
+                        })
+                        .map_or_else(
+                            || "iTunes/7.6.2 (Windows; N;)".to_owned(),
+                            |_| "AirPlay/999.0.0".to_owned(),
+                        ),
+                    auth_setup: info
+                        .get_property_val_str("et")
+                        .is_some_and(|value| value.contains('4')),
+                };
+                if !endpoints.contains(&endpoint) {
+                    endpoints.push(endpoint);
+                }
+            }
+        }
+    }
+    let _ = daemon.shutdown();
+    Ok(endpoints)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RaopEndpoint {
+    pub address: SocketAddr,
+    pub name: String,
+    pub user_agent: String,
+    pub auth_setup: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioPacket {
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PcmAudioFrame {
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub sample_rate: u32,
+    pub channels: u8,
+    /// Interleaved signed 16-bit PCM, little-endian.
+    pub pcm: Vec<u8>,
+}
+
+pub struct PcmToRaop {
+    encoder: AlacEncoder,
+    input: FormatDescription,
+    input_sample_rate: u32,
+    sample_rate: u32,
+    channels: u8,
+    samples_per_packet: usize,
+    pending: Vec<u8>,
+    resample_input: Vec<i16>,
+    resample_phase: f64,
+    next_sequence: u16,
+    next_timestamp: u32,
+}
+
+impl PcmToRaop {
+    pub fn new(sample_rate: u32, channels: u8) -> Result<Self, RaopError> {
+        Self::new_resampled(sample_rate, sample_rate, channels)
+    }
+
+    pub fn new_resampled(
+        input_sample_rate: u32,
+        sample_rate: u32,
+        channels: u8,
+    ) -> Result<Self, RaopError> {
+        if channels == 0 || channels > 2 || input_sample_rate == 0 || sample_rate == 0 {
+            return Err(RaopError::UnsupportedAudioFormat {
+                sample_rate: input_sample_rate,
+                channels,
+            });
+        }
+        let output = FormatDescription::alac(sample_rate as f64, 352, channels as u32);
+        let input = FormatDescription::pcm::<i16>(input_sample_rate as f64, channels as u32);
+        Ok(Self {
+            encoder: AlacEncoder::new(&output),
+            input,
+            input_sample_rate,
+            sample_rate,
+            channels,
+            samples_per_packet: 352,
+            pending: Vec::new(),
+            resample_input: Vec::new(),
+            resample_phase: 0.0,
+            next_sequence: rand_seed() as u16,
+            next_timestamp: rand_seed(),
+        })
+    }
+
+    pub fn push(&mut self, frame: PcmAudioFrame) -> Result<Vec<AudioPacket>, RaopError> {
+        if frame.sample_rate != self.input_sample_rate || frame.channels != self.channels {
+            return Err(RaopError::UnsupportedAudioFormat {
+                sample_rate: frame.sample_rate,
+                channels: frame.channels,
+            });
+        }
+        let bytes_per_sample = self.channels as usize * 2;
+        if frame.pcm.len() % bytes_per_sample != 0 {
+            return Err(RaopError::InvalidPcmLength(frame.pcm.len()));
+        }
+        if self.input_sample_rate == self.sample_rate {
+            self.pending.extend_from_slice(&frame.pcm);
+        } else {
+            self.resample_input.extend(
+                frame
+                    .pcm
+                    .chunks_exact(2)
+                    .map(|sample| i16::from_le_bytes([sample[0], sample[1]])),
+            );
+            let input_frames = self.resample_input.len() / self.channels as usize;
+            let ratio = self.input_sample_rate as f64 / self.sample_rate as f64;
+            while self.resample_phase + 1.0 < input_frames as f64 {
+                let source = self.resample_phase.floor() as usize;
+                let fraction = self.resample_phase.fract();
+                for channel in 0..self.channels as usize {
+                    let first =
+                        self.resample_input[source * self.channels as usize + channel] as f64;
+                    let second =
+                        self.resample_input[(source + 1) * self.channels as usize + channel] as f64;
+                    let sample = (first + (second - first) * fraction)
+                        .round()
+                        .clamp(i16::MIN as f64, i16::MAX as f64)
+                        as i16;
+                    self.pending.extend_from_slice(&sample.to_le_bytes());
+                }
+                self.resample_phase += ratio;
+            }
+            let consumed = self.resample_phase.floor() as usize;
+            if consumed > 0 {
+                self.resample_input
+                    .drain(..consumed * self.channels as usize);
+                self.resample_phase -= consumed as f64;
+            }
+        }
+        let packet_bytes = self.samples_per_packet * bytes_per_sample;
+        let mut packets = Vec::new();
+        while self.pending.len() >= packet_bytes {
+            let pcm: Vec<u8> = self.pending.drain(..packet_bytes).collect();
+            let mut encoded = vec![0; pcm.len() + self.input.max_packet_size()];
+            let size = self.encoder.encode(&self.input, &pcm, &mut encoded);
+            encoded.truncate(size);
+            packets.push(AudioPacket {
+                sequence: self.next_sequence,
+                timestamp: self.next_timestamp,
+                payload: encoded,
+            });
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            self.next_timestamp = self
+                .next_timestamp
+                .wrapping_add(self.samples_per_packet as u32);
+        }
+        Ok(packets)
+    }
+
+    pub fn buffered_samples(&self) -> usize {
+        self.pending.len() / (self.channels as usize * 2)
+    }
+}
+
+pub struct RaopClient {
+    rtsp: TcpStream,
+    session: String,
+    negotiated_session: Option<String>,
+    rtsp_url: String,
+    user_agent: String,
+    auth_setup: bool,
+    cseq: u32,
+    ssrc: u32,
+    audio: Option<Arc<UdpSocket>>,
+    control: Option<Arc<UdpSocket>>,
+    _timing: Arc<UdpSocket>,
+    remote_audio: SocketAddr,
+    remote_control: SocketAddr,
+    remote_timing: SocketAddr,
+    next_sequence: u16,
+    next_timestamp: u32,
+    ntp_base: u64,
+    aes_key: [u8; 16],
+    aes_iv: [u8; 16],
+    client_instance: String,
+    encrypted: bool,
+    password: Option<String>,
+    auth: Option<(String, String)>,
+    backlog: RtpBacklog,
+    running: Arc<AtomicBool>,
+    stream_timestamp: Arc<AtomicU32>,
+    sample_rate: u32,
+    first_packet: bool,
+    recording: bool,
+    audio_packet_count: u64,
+    audio_payload_bytes: u64,
+}
+
+impl RaopClient {
+    pub async fn connect(endpoint: &RaopEndpoint) -> Result<Self, RaopError> {
+        Self::connect_with_password(endpoint, 44_100, 2, None).await
+    }
+
+    pub async fn connect_with_audio_format(
+        endpoint: &RaopEndpoint,
+        sample_rate: u32,
+        channels: u8,
+    ) -> Result<Self, RaopError> {
+        Self::connect_with_password(endpoint, sample_rate, channels, None).await
+    }
+
+    pub async fn connect_with_password(
+        endpoint: &RaopEndpoint,
+        sample_rate: u32,
+        channels: u8,
+        password: Option<&str>,
+    ) -> Result<Self, RaopError> {
+        if channels == 0 || channels > 2 || sample_rate == 0 {
+            return Err(RaopError::UnsupportedAudioFormat {
+                sample_rate,
+                channels,
+            });
+        }
+        let rtsp = TcpStream::connect(endpoint.address).await?;
+        let local_addr = rtsp.local_addr()?;
+        let local_ip = local_addr.ip();
+        let timing = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let timing_port = timing.local_addr()?.port();
+        let session = format!("{:010}", rand_seed());
+        let mut aes_key = [0u8; 16];
+        let mut aes_iv = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut aes_key);
+        rand::thread_rng().fill_bytes(&mut aes_iv);
+        let client_instance = format!("{:016x}", rand::random::<u64>());
+        let initial_timestamp = rand_seed();
+        let mut client = Self {
+            rtsp,
+            rtsp_url: format!("rtsp://{}/{}", endpoint.address.ip(), session),
+            user_agent: endpoint.user_agent.clone(),
+            auth_setup: endpoint.auth_setup,
+            session,
+            negotiated_session: None,
+            cseq: 1,
+            ssrc: rand_seed(),
+            audio: None,
+            control: None,
+            _timing: Arc::new(timing),
+            remote_audio: SocketAddr::new(endpoint.address.ip(), 0),
+            remote_control: SocketAddr::new(endpoint.address.ip(), 0),
+            remote_timing: SocketAddr::new(endpoint.address.ip(), 0),
+            next_sequence: rand_seed() as u16,
+            next_timestamp: initial_timestamp,
+            ntp_base: ntp_now_u64()
+                .wrapping_sub((u64::from(initial_timestamp) << 32) / u64::from(sample_rate)),
+            aes_key,
+            aes_iv,
+            client_instance,
+            encrypted: false,
+            password: password.map(str::to_owned),
+            auth: None,
+            backlog: Arc::new(Mutex::new(VecDeque::with_capacity(512))),
+            running: Arc::new(AtomicBool::new(true)),
+            stream_timestamp: Arc::new(AtomicU32::new(0)),
+            sample_rate,
+            first_packet: true,
+            recording: true,
+            audio_packet_count: 0,
+            audio_payload_bytes: 0,
+        };
+
+        client.request("OPTIONS", "", &[]).await?;
+        if client.auth_setup {
+            let secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let public_key = PublicKey::from(&secret);
+            let mut auth_body = Vec::with_capacity(33);
+            auth_body.push(0x01);
+            auth_body.extend_from_slice(public_key.as_bytes());
+            client
+                .request_uri(
+                    "POST",
+                    "/auth-setup",
+                    &auth_body,
+                    &[("Content-Type", "application/octet-stream")],
+                )
+                .await?;
+        }
+        let local_ip_text = match local_ip {
+            IpAddr::V4(ip) => format!("IN IP4 {ip}"),
+            IpAddr::V6(ip) => format!("IN IP6 {ip}"),
+        };
+        let remote_ip_text = match endpoint.address.ip() {
+            IpAddr::V4(ip) => format!("IN IP4 {ip}"),
+            IpAddr::V6(ip) => format!("IN IP6 {ip}"),
+        };
+        let crypto_sdp = if client.encrypted {
+            let encrypted_key = rsa_encrypt_key(&client.aes_key)?;
+            let key = STANDARD
+                .encode(encrypted_key)
+                .trim_end_matches('=')
+                .to_owned();
+            let iv = STANDARD
+                .encode(client.aes_iv)
+                .trim_end_matches('=')
+                .to_owned();
+            format!("a=rsaaeskey:{key}\r\na=aesiv:{iv}\r\n")
+        } else {
+            String::new()
+        };
+        let sdp = format!(
+            "v=0\r\no=iTunes {} 0 {}\r\ns=iTunes\r\nc={}\r\nt=0 0\r\n\
+m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 {} 255 0 0 {}\r\n\
+{}",
+            client.session, local_ip_text, remote_ip_text, channels, sample_rate, crypto_sdp
+        );
+        client
+            .request("ANNOUNCE", &sdp, &[("Content-Type", "application/sdp")])
+            .await?;
+        client.start_timing_worker();
+        let control = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let audio = UdpSocket::bind(local_bind_addr(local_addr, endpoint.address)).await?;
+        let control_port = control.local_addr()?.port();
+        let audio = Arc::new(audio);
+        let control = Arc::new(control);
+        client.audio = Some(Arc::clone(&audio));
+        client.control = Some(Arc::clone(&control));
+        let transport = format!(
+            "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
+            control_port, timing_port
+        );
+        let response = client
+            .request("SETUP", "", &[("Transport", &transport)])
+            .await?;
+        let (remote_audio, remote_control, remote_timing) = parse_transport(
+            response
+                .headers
+                .get("transport")
+                .ok_or(RaopError::MissingHeader("Transport"))?,
+            endpoint.address,
+        )?;
+        client.negotiated_session = response.headers.get("session").cloned();
+        client.remote_audio = remote_audio;
+        client.remote_control = remote_control;
+        client.remote_timing = remote_timing;
+        audio.connect(remote_audio).await?;
+        control.connect(remote_control).await?;
+        if remote_timing.port() != 0 {
+            client._timing.connect(remote_timing).await?;
+        }
+        client.rebase_audio_clock();
+        client
+            .request(
+                "RECORD",
+                "",
+                &[
+                    ("Range", "npt=0-"),
+                    (
+                        "RTP-Info",
+                        &format!(
+                            "seq={};rtptime={}",
+                            client.next_sequence, client.next_timestamp
+                        ),
+                    ),
+                ],
+            )
+            .await?;
+        client.start_rtp_workers();
+        Ok(client)
+    }
+
+    pub async fn send_alac(&mut self, packet: &AudioPacket) -> Result<(), RaopError> {
+        if packet.payload.len() > u16::MAX as usize {
+            return Err(RaopError::AudioPayloadTooLarge);
+        }
+        if self.first_packet {
+            self.control
+                .as_ref()
+                .expect("RAOP control socket initialized")
+                .send(&build_sync_packet(
+                    self.next_timestamp,
+                    self.ntp_base,
+                    self.sample_rate,
+                    true,
+                ))
+                .await?;
+        }
+        let sequence = self.next_sequence;
+        let timestamp = self.next_timestamp;
+        let mut rtp = Vec::with_capacity(RTP_HEADER_LEN + packet.payload.len());
+        rtp.extend_from_slice(&[0x80, if self.first_packet { 0xe0 } else { 0x60 }]);
+        rtp.extend_from_slice(&sequence.to_be_bytes());
+        rtp.extend_from_slice(&timestamp.to_be_bytes());
+        rtp.extend_from_slice(&self.ssrc.to_be_bytes());
+        let mut payload = packet.payload.clone();
+        if self.encrypted {
+            encrypt_rtp_payload(&mut payload, &self.aes_key, &self.aes_iv);
+        }
+        rtp.extend_from_slice(&payload);
+        if let Ok(mut backlog) = self.backlog.lock() {
+            backlog.push_back((sequence, rtp.clone()));
+            while backlog.len() > 512 {
+                backlog.pop_front();
+            }
+        }
+        tracing::trace!(
+            sequence,
+            timestamp,
+            payload_bytes = packet.payload.len(),
+            "RAOP RTP audio packet"
+        );
+        self.audio
+            .as_ref()
+            .expect("RAOP audio socket initialized")
+            .send(&rtp)
+            .await?;
+        self.first_packet = false;
+        self.next_sequence = sequence.wrapping_add(1);
+        self.next_timestamp = timestamp.wrapping_add(352);
+        self.stream_timestamp.store(timestamp, Ordering::Relaxed);
+        self.audio_packet_count += 1;
+        self.audio_payload_bytes += packet.payload.len() as u64;
+        if self.audio_packet_count % 100 == 0 {
+            tracing::debug!(
+                packets = self.audio_packet_count,
+                payload_bytes = self.audio_payload_bytes,
+                sequence,
+                timestamp,
+                "RAOP audio transmission progress"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn send_pcm(
+        &mut self,
+        bridge: &mut PcmToRaop,
+        frame: PcmAudioFrame,
+    ) -> Result<usize, RaopError> {
+        if !self.recording {
+            return Ok(0);
+        }
+        let packets = bridge.push(frame)?;
+        let count = packets.len();
+        for packet in packets {
+            self.send_alac(&packet).await?;
+        }
+        Ok(count)
+    }
+
+    pub async fn pause(&mut self) -> Result<(), RaopError> {
+        self.request(
+            "FLUSH",
+            "",
+            &[(
+                "RTP-Info",
+                &format!("seq={},rtptime={}", self.next_sequence, self.next_timestamp),
+            )],
+        )
+        .await?;
+        self.recording = false;
+        Ok(())
+    }
+
+    pub async fn resume(&mut self) -> Result<(), RaopError> {
+        if self.recording {
+            return Ok(());
+        }
+        self.rebase_audio_clock();
+        let rtp_info = format!("seq={};rtptime={}", self.next_sequence, self.next_timestamp);
+        self.request(
+            "RECORD",
+            "",
+            &[("Range", "npt=0-"), ("RTP-Info", &rtp_info)],
+        )
+        .await?;
+        self.recording = true;
+        Ok(())
+    }
+
+    fn rebase_audio_clock(&mut self) {
+        let now = ntp_now_u64();
+        let timestamp = (now.wrapping_mul(u64::from(self.sample_rate)) >> 32) as u32;
+        self.next_timestamp = timestamp;
+        self.ntp_base =
+            now.wrapping_sub((u64::from(timestamp) << 32) / u64::from(self.sample_rate));
+        self.stream_timestamp.store(timestamp, Ordering::Relaxed);
+    }
+
+    pub async fn set_volume(&mut self, volume: f32) -> Result<(), RaopError> {
+        let volume = volume.clamp(-30.0, 0.0);
+        self.request(
+            "SET_PARAMETER",
+            &format!("volume: {volume:.2}\r\n"),
+            &[("Content-Type", "text/parameters")],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_volume(&mut self) -> Result<Option<u8>, RaopError> {
+        let response = self
+            .request(
+                "GET_PARAMETER",
+                "volume\r\n",
+                &[("Content-Type", "text/parameters")],
+            )
+            .await?;
+        let body = std::str::from_utf8(&response.body).unwrap_or_default();
+        let Some(value) = body.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("volume")
+                .then_some(value.trim())
+        }) else {
+            return Ok(None);
+        };
+        let db = value
+            .parse::<f32>()
+            .map_err(|_| RaopError::InvalidResponse(value.to_owned()))?;
+        Ok(Some(Self::volume_percent(db)))
+    }
+
+    pub fn volume_db(volume: u8) -> f32 {
+        if volume == 0 {
+            -30.0
+        } else {
+            -30.0 + 30.0 * (volume as f32 / 100.0)
+        }
+    }
+
+    pub fn volume_percent(db: f32) -> u8 {
+        if db <= -30.0 {
+            0
+        } else {
+            ((db / 30.0 + 1.0) * 100.0).round().clamp(0.0, 100.0) as u8
+        }
+    }
+
+    pub async fn stop(mut self) -> Result<(), RaopError> {
+        self.running.store(false, Ordering::Relaxed);
+        self.request("TEARDOWN", "", &[]).await?;
+        Ok(())
+    }
+
+    fn start_rtp_workers(&self) {
+        let control = Arc::clone(
+            self.control
+                .as_ref()
+                .expect("RAOP control socket initialized"),
+        );
+        let backlog = Arc::clone(&self.backlog);
+        let running = Arc::clone(&self.running);
+        let stream_timestamp = Arc::clone(&self.stream_timestamp);
+        let sample_rate = self.sample_rate;
+        let ntp_base = self.ntp_base;
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 64];
+            let mut sync_interval = tokio::time::interval(Duration::from_secs(1));
+            while running.load(Ordering::Relaxed) {
+                tokio::select! {
+                    result = control.recv(&mut buffer) => {
+                        let Ok(size) = result else { break };
+                        if size < 8 {
+                            continue;
+                        }
+                        let sequence = u16::from_be_bytes([buffer[4], buffer[5]]);
+                        let count = u16::from_be_bytes([buffer[6], buffer[7]]);
+                        for offset in 0..count {
+                            let missing = sequence.wrapping_add(offset);
+                            let packet = backlog.lock().ok().and_then(|items| {
+                                items.iter().find(|(seq, _)| *seq == missing)
+                                    .map(|(_, packet)| packet.clone())
+                            });
+                            if let Some(mut packet) = packet {
+                                packet[1] = 0xd6;
+                                tracing::debug!(sequence = missing, "RAOP RTP packet retransmit");
+                                let _ = control.send(&packet).await;
+                            }
+                        }
+                    }
+                    _ = sync_interval.tick() => {
+                        let timestamp = stream_timestamp.load(Ordering::Relaxed);
+                        tracing::trace!(timestamp, "RAOP RTP sync packet");
+                        let _ = control.send(&build_sync_packet(
+                            timestamp,
+                            ntp_base,
+                            sample_rate,
+                            false,
+                        )).await;
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_timing_worker(&self) {
+        let timing = Arc::clone(&self._timing);
+        let running = Arc::clone(&self.running);
+        tokio::spawn(async move {
+            let mut request = [0u8; 32];
+            while running.load(Ordering::Relaxed) {
+                let Ok((size, peer)) = timing.recv_from(&mut request).await else {
+                    break;
+                };
+                if size != 32 {
+                    continue;
+                }
+                let mut response = request;
+                response[1] = 0xd3;
+                response[8..16].copy_from_slice(&request[24..32]);
+                let now = ntp_now();
+                tracing::trace!(%peer, "RAOP RTP timing response");
+                response[16..24].copy_from_slice(&now);
+                response[24..32].copy_from_slice(&now);
+                let _ = timing.send_to(&response, peer).await;
+            }
+        });
+    }
+
+    async fn request(
+        &mut self,
+        method: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Response, RaopError> {
+        let target = if method == "OPTIONS" {
+            "*".to_owned()
+        } else {
+            self.rtsp_url.clone()
+        };
+        self.request_target(method, &target, body.as_bytes(), headers)
+            .await
+    }
+
+    async fn request_uri(
+        &mut self,
+        method: &str,
+        uri: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response, RaopError> {
+        self.request_target(method, uri, body, headers).await
+    }
+
+    async fn request_target(
+        &mut self,
+        method: &str,
+        target: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response, RaopError> {
+        let mut request = format!(
+            "{method} {target} RTSP/1.0\r\nCSeq: {}\r\n\
+User-Agent: {}\r\nClient-Instance: {}\r\n",
+            self.cseq, self.user_agent, self.client_instance
+        )
+        .into_bytes();
+        if let Some(session) = &self.negotiated_session {
+            request.extend_from_slice(format!("Session: {session}\r\n").as_bytes());
+        }
+        for (name, value) in headers {
+            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        if !body.is_empty() {
+            request.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        }
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(body);
+        trace_rtsp_request(method, self.cseq, headers, body, false);
+        self.rtsp.write_all(&request).await?;
+        self.cseq += 1;
+        let response = read_response(&mut self.rtsp).await?;
+        trace_rtsp_response(method, self.cseq - 1, &response);
+        tracing::debug!(
+            method,
+            cseq = self.cseq - 1,
+            status = response.status,
+            "RAOP RTSP response"
+        );
+        if response.status == 401 {
+            let Some(password) = self.password.as_deref() else {
+                return Err(RaopError::RequestFailed {
+                    status: response.status,
+                    reason: "receiver requires a password".into(),
+                });
+            };
+            let Some(challenge) = response.headers.get("www-authenticate") else {
+                return Err(RaopError::InvalidResponse(
+                    "401 response missing WWW-Authenticate".into(),
+                ));
+            };
+            self.auth = parse_digest_challenge(challenge);
+            let Some((realm, nonce)) = self.auth.clone() else {
+                return Err(RaopError::InvalidResponse(
+                    "unsupported WWW-Authenticate challenge".into(),
+                ));
+            };
+            let uri = if method == "OPTIONS" { "*" } else { target };
+            let username = if realm.eq_ignore_ascii_case("raop") {
+                "iTunes"
+            } else {
+                "AirPlay"
+            };
+            let ha1 = md5_hex(format!("{username}:{realm}:{password}").as_bytes());
+            let ha2 = md5_hex(format!("{method}:{uri}").as_bytes());
+            let response_hash = md5_hex(format!("{ha1}:{nonce}:{ha2}").as_bytes());
+            let authorization = format!(
+                "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response_hash}\""
+            );
+            let mut retry = format!(
+                "{method} {target} RTSP/1.0\r\nCSeq: {}\r\n\
+User-Agent: {}\r\nClient-Instance: {}\r\nAuthorization: {authorization}\r\n",
+                self.cseq, self.user_agent, self.client_instance
+            )
+            .into_bytes();
+            if let Some(session) = &self.negotiated_session {
+                retry.extend_from_slice(format!("Session: {session}\r\n").as_bytes());
+            }
+            for (name, value) in headers {
+                retry.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+            if !body.is_empty() {
+                retry.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+            }
+            retry.extend_from_slice(b"\r\n");
+            retry.extend_from_slice(body);
+            trace_rtsp_request(method, self.cseq, headers, body, true);
+            self.rtsp.write_all(&retry).await?;
+            self.cseq += 1;
+            let response = read_response(&mut self.rtsp).await?;
+            trace_rtsp_response(method, self.cseq - 1, &response);
+            tracing::debug!(
+                method,
+                cseq = self.cseq - 1,
+                status = response.status,
+                "RAOP RTSP authenticated response"
+            );
+            if !(200..300).contains(&response.status) {
+                return Err(RaopError::RequestFailed {
+                    status: response.status,
+                    reason: response.reason,
+                });
+            }
+            return Ok(response);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(RaopError::RequestFailed {
+                status: response.status,
+                reason: response.reason,
+            });
+        }
+        Ok(response)
+    }
+}
+
+#[derive(Debug)]
+struct Response {
+    status: u16,
+    reason: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+async fn read_response(stream: &mut TcpStream) -> Result<Response, RaopError> {
+    let mut buffer = Vec::new();
+    let header_end;
+    loop {
+        let mut chunk = [0; 1024];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(RaopError::InvalidResponse("connection closed".into()));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = end + 4;
+            break;
+        }
+        if buffer.len() > 64 * 1024 {
+            return Err(RaopError::InvalidResponse("headers too large".into()));
+        }
+    }
+    let text = std::str::from_utf8(&buffer[..header_end])
+        .map_err(|_| RaopError::InvalidResponse("headers are not UTF-8".into()))?;
+    let mut lines = text.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| RaopError::InvalidResponse("missing status".into()))?;
+    let mut status_parts = status_line.splitn(3, ' ');
+    if status_parts.next() != Some("RTSP/1.0") {
+        return Err(RaopError::InvalidResponse(status_line.into()));
+    }
+    let status = status_parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| RaopError::InvalidResponse(status_line.into()))?;
+    let reason = status_parts.next().unwrap_or_default().into();
+    let mut headers = std::collections::HashMap::<String, String>::new();
+    for line in lines.filter(|line| !line.is_empty()) {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().into());
+        }
+    }
+    let body_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    while buffer.len() < header_end + body_length {
+        let mut chunk = [0; 1024];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(RaopError::InvalidResponse("truncated response body".into()));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    Ok(Response {
+        status,
+        reason,
+        headers,
+        body: buffer[header_end..header_end + body_length].to_vec(),
+    })
+}
+
+fn trace_rtsp_request(
+    method: &str,
+    cseq: u32,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    authenticated: bool,
+) {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", redact_rtsp_value(name, value)))
+        .collect::<Vec<_>>();
+    tracing::trace!(
+        method,
+        cseq,
+        authenticated,
+        headers = ?headers,
+        body_bytes = body.len(),
+        body = %summarize_rtsp_body(body),
+        "RAOP RTSP request"
+    );
+}
+
+fn trace_rtsp_response(method: &str, cseq: u32, response: &Response) {
+    let headers = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", redact_rtsp_value(name, value)))
+        .collect::<Vec<_>>();
+    tracing::trace!(
+        method,
+        cseq,
+        status = response.status,
+        reason = %response.reason,
+        headers = ?headers,
+        body_bytes = response.body.len(),
+        body = %summarize_rtsp_bytes(&response.body),
+        "RAOP RTSP response details"
+    );
+}
+
+fn redact_rtsp_value(name: &str, value: &str) -> String {
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "cookie" | "apple-response"
+    ) {
+        "<redacted>".into()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn summarize_rtsp_body(body: &[u8]) -> String {
+    let Ok(body) = std::str::from_utf8(body) else {
+        return summarize_rtsp_bytes(body);
+    };
+    if body.contains("rsaaeskey:") || body.contains("aesiv:") {
+        return body
+            .lines()
+            .map(|line| {
+                if line.starts_with("a=rsaaeskey:") {
+                    "a=rsaaeskey:<redacted>".to_owned()
+                } else if line.starts_with("a=aesiv:") {
+                    "a=aesiv:<redacted>".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\\n");
+    }
+    summarize_rtsp_bytes(body.as_bytes())
+}
+
+fn summarize_rtsp_bytes(body: &[u8]) -> String {
+    if body.is_empty() {
+        "<empty>".into()
+    } else if body
+        .iter()
+        .all(|byte| matches!(byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e))
+    {
+        let text = String::from_utf8_lossy(body);
+        let text = text.trim();
+        if text.len() > 512 {
+            format!("{}…", text.chars().take(512).collect::<String>())
+        } else {
+            text.to_owned()
+        }
+    } else {
+        let shown = body
+            .iter()
+            .take(96)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if body.len() > 96 {
+            format!("<binary {} bytes hex={}…>", body.len(), shown)
+        } else {
+            format!("<binary {} bytes hex={shown}>", body.len())
+        }
+    }
+}
+
+fn parse_digest_challenge(value: &str) -> Option<(String, String)> {
+    let value = value.strip_prefix("Digest ")?;
+    let mut realm = None;
+    let mut nonce = None;
+    for item in value.split(',') {
+        let (name, value) = item.trim().split_once('=')?;
+        let value = value.trim().trim_matches('"').to_owned();
+        match name {
+            "realm" => realm = Some(value),
+            "nonce" => nonce = Some(value),
+            _ => {}
+        }
+    }
+    Some((realm?, nonce?))
+}
+
+fn md5_hex(value: &[u8]) -> String {
+    let mut digest = Md5::new();
+    digest.update(value);
+    hex::encode(digest.finalize())
+}
+
+fn parse_transport(
+    value: &str,
+    endpoint: SocketAddr,
+) -> Result<(SocketAddr, SocketAddr, SocketAddr), RaopError> {
+    let mut audio = None;
+    let mut control = None;
+    let mut timing = None;
+    for item in value.split(';') {
+        let Some((key, port)) = item.split_once('=') else {
+            continue;
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "server_port" => audio = port.parse::<u16>().ok(),
+            "control_port" => control = port.parse::<u16>().ok(),
+            "timing_port" => timing = port.parse::<u16>().ok(),
+            _ => {}
+        }
+    }
+    let audio = audio.ok_or(RaopError::MissingHeader("Transport server_port"))?;
+    let control = control.ok_or(RaopError::MissingHeader("Transport control_port"))?;
+    let timing = timing.unwrap_or(0);
+    Ok((
+        SocketAddr::new(endpoint.ip(), audio).with_scope_from(endpoint),
+        SocketAddr::new(endpoint.ip(), control).with_scope_from(endpoint),
+        SocketAddr::new(endpoint.ip(), timing).with_scope_from(endpoint),
+    ))
+}
+
+fn with_ipv6_scope(address: SocketAddr) -> SocketAddr {
+    let SocketAddr::V6(mut address) = address else {
+        return address;
+    };
+    if address.scope_id() != 0 || !address.ip().is_unicast_link_local() {
+        return SocketAddr::V6(address);
+    }
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        if let Some(interface) = interfaces.iter().find(|interface| {
+            interface.is_oper_up()
+                && interface.is_link_local()
+                && !interface.is_loopback()
+                && interface.index.is_some()
+        }) {
+            address.set_scope_id(interface.index.unwrap_or_default());
+        }
+    }
+    SocketAddr::V6(address)
+}
+
+fn local_bind_addr(address: SocketAddr, remote: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(address) => SocketAddr::new(IpAddr::V4(*address.ip()), 0),
+        SocketAddr::V6(address) => {
+            let scope = if address.scope_id() != 0 {
+                address.scope_id()
+            } else if let SocketAddr::V6(remote) = remote {
+                remote.scope_id()
+            } else {
+                0
+            };
+            SocketAddr::V6(SocketAddrV6::new(*address.ip(), 0, 0, scope))
+        }
+    }
+}
+
+trait SocketAddrScope {
+    fn with_scope_from(self, source: SocketAddr) -> SocketAddr;
+}
+
+impl SocketAddrScope for SocketAddr {
+    fn with_scope_from(self, source: SocketAddr) -> SocketAddr {
+        match (self, source) {
+            (SocketAddr::V6(mut address), SocketAddr::V6(source)) => {
+                address.set_scope_id(source.scope_id());
+                SocketAddr::V6(address)
+            }
+            (address, _) => address,
+        }
+    }
+}
+
+fn ntp_now() -> [u8; 8] {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = (now.as_secs() + 2_208_988_800) as u32;
+    let fraction = ((u64::from(now.subsec_nanos()) << 32) / 1_000_000_000) as u32;
+    let mut result = [0; 8];
+    result[..4].copy_from_slice(&seconds.to_be_bytes());
+    result[4..].copy_from_slice(&fraction.to_be_bytes());
+    result
+}
+
+fn ntp_now_u64() -> u64 {
+    u64::from_be_bytes(ntp_now())
+}
+
+fn build_sync_packet(timestamp: u32, ntp_base: u64, sample_rate: u32, first: bool) -> [u8; 20] {
+    let mut packet = [0u8; 20];
+    packet[0] = if first { 0x90 } else { 0x80 };
+    packet[1] = 0xd4;
+    packet[2..4].copy_from_slice(&7u16.to_be_bytes());
+    let ntp = ntp_base.wrapping_add((u64::from(timestamp) << 32) / u64::from(sample_rate));
+    packet[4..12].copy_from_slice(&ntp.to_be_bytes());
+    packet[12..16].copy_from_slice(&timestamp.to_be_bytes());
+    packet[16..20].copy_from_slice(&timestamp.wrapping_sub(11_025).to_be_bytes());
+    packet
+}
+
+fn rand_seed() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+}
+
+fn rsa_encrypt_key(key: &[u8; 16]) -> Result<Vec<u8>, RaopError> {
+    const MODULUS: &str = "59dE8qLieItsH1WgjrcFRKj6eUWqi+bGLOX1HL3U3GhC/j0Qg90u3sG/1CUtwC5vOYvfDmFI6oSFXi5ELabWJmT2dKHzBJKa3k9ok+8t9ucRqMd6DZHJ2YCCLlDRKSKv6kDqnw4UwPdpOMXziC/AMj3Z/lUVX1G7WSHCAWKf1zNS1eLvqr+boEjXuBOitnZ/bDzPHrTOZz0Dew0uowxf/+sG+NCK3eQJVxqcaJ/vEHKIVd2M+5qL71yJQ+87X6oV3eaYvt3zWZYD6z5vYTcrtij2VZ9Zmni/UAaHqn9JdsBWLUEpVviYnhimNVvYFZeCXg/IdTQ+x4IRdiXNv5hEew==";
+    let modulus = STANDARD
+        .decode(MODULUS)
+        .map_err(|error| RaopError::Crypto(error.to_string()))?;
+    let public = RsaPublicKey::new(
+        rsa::BigUint::from_bytes_be(&modulus),
+        rsa::BigUint::from(65_537u32),
+    )
+    .map_err(|error| RaopError::Crypto(error.to_string()))?;
+    public
+        .encrypt(&mut rand::thread_rng(), Oaep::new::<Sha1>(), key)
+        .map_err(|error| RaopError::Crypto(error.to_string()))
+}
+
+fn encrypt_rtp_payload(payload: &mut [u8], key: &[u8; 16], iv: &[u8; 16]) {
+    let cipher = Aes128::new_from_slice(key).expect("AES-128 keys are always 16 bytes");
+    let mut previous = *iv;
+    for block in payload.chunks_exact_mut(16) {
+        for (byte, previous_byte) in block.iter_mut().zip(previous) {
+            *byte ^= previous_byte;
+        }
+        cipher.encrypt_block(block.into());
+        previous.copy_from_slice(block);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffers_pcm_until_an_alac_chunk_is_ready() {
+        let mut bridge = PcmToRaop::new(44_100, 2).unwrap();
+        let pcm = vec![0; 352 * 2 * 2];
+        let packets = bridge
+            .push(PcmAudioFrame {
+                sequence: 10,
+                timestamp: 100,
+                sample_rate: 44_100,
+                channels: 2,
+                pcm,
+            })
+            .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].sequence.wrapping_add(1), bridge.next_sequence);
+        assert_eq!(
+            packets[0].timestamp.wrapping_add(352),
+            bridge.next_timestamp
+        );
+        assert!(!packets[0].payload.is_empty());
+    }
+
+    #[test]
+    fn rejects_misaligned_pcm() {
+        let mut bridge = PcmToRaop::new(48_000, 2).unwrap();
+        let error = bridge
+            .push(PcmAudioFrame {
+                sequence: 0,
+                timestamp: 0,
+                sample_rate: 48_000,
+                channels: 2,
+                pcm: vec![0; 3],
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "PCM payload length 3 is not aligned to the sample format"
+        );
+    }
+
+    #[test]
+    fn parses_server_ports() {
+        assert_eq!(
+            parse_transport(
+                "RTP/AVP/UDP;server_port=6000;control_port=6001;timing_port=6002",
+                "192.0.2.1:7000".parse().unwrap()
+            )
+            .unwrap(),
+            (
+                "192.0.2.1:6000".parse().unwrap(),
+                "192.0.2.1:6001".parse().unwrap(),
+                "192.0.2.1:6002".parse().unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn builds_rtp_header_shape() {
+        let packet = AudioPacket {
+            sequence: 3,
+            timestamp: 4,
+            payload: vec![1, 2],
+        };
+        assert_eq!(packet.payload.len() + RTP_HEADER_LEN, 14);
+    }
+
+    #[test]
+    fn parses_digest_challenge() {
+        assert_eq!(
+            parse_digest_challenge(r#"Digest realm="raop", nonce="abc123""#),
+            Some(("raop".into(), "abc123".into()))
+        );
+    }
+
+    #[test]
+    fn computes_digest_md5() {
+        assert_eq!(
+            md5_hex(b"iTunes:raop:secret"),
+            "70b47eb170d318a98a36e7a16a7eae7a"
+        );
+    }
+
+    #[test]
+    fn builds_periodic_sync_packet() {
+        let packet = build_sync_packet(48_000, 0, 48_000, false);
+        assert_eq!(&packet[..4], &[0x80, 0xd4, 0, 7]);
+        assert_eq!(&packet[12..16], &48_000u32.to_be_bytes());
+        assert_eq!(
+            &packet[16..20],
+            &48_000u32.wrapping_sub(11_025).to_be_bytes()
+        );
+    }
+}

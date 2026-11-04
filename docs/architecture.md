@@ -135,15 +135,32 @@ player = "HomePod"
 
 只有在具备真实小米客户端和 AirPlay 播放器时，才记录发现、认证、音频、控制和重连结果；报告包含型号、OS、网络、音频格式、测量方法和误差。
 
+`.github/workflows/build.yml` 提供 push、pull request 和手动触发的跨平台构建，
+产出 Windows x86/x86_64、macOS x86_64/arm64，以及 Linux x86、x86_64、armv7
+和 aarch64 的 CLI 压缩包。真实联调建议设置 `RUST_LOG=mi2play=debug`；需要
+更细的 RTP/timing/PCM 计数时使用 `trace`，日志不会包含密码或 AES 密钥。
+
 ## 分阶段交付
 
-1. **阶段 1/2（当前）**：参考分析、许可证边界、架构和协议风险。
-2. **阶段 3**：Rust workspace、配置/CLI、模拟器、单设备虚拟 MiPlay responder、单设备 RAOP 输出骨架和测试。
+1. **阶段 1/2**：参考分析、许可证边界、架构和协议风险。
+2. **阶段 3（当前）**：Rust workspace、配置/CLI、MiPlay 帧状态机和 RAOP 输出层（RTSP/RTP 控制与协议测试）。
 3. **阶段 4**：真实 MiPlay 控制/媒体兼容、AirPlay 发现、音量/状态、重连和多设备。
 4. **阶段 5**：跨平台构建、服务安装、性能测量、兼容性矩阵和发布文档。
 
 ## 当前不能承诺的能力
 
 - 未取得真实客户端/播放器验证前，不承诺 HomePod 认证、所有 HyperOS 版本兼容或完整 RAOP v1/v2 覆盖。
+- 当前实现已提供 PCM 数据面适配：`PcmAudioFrame` 接收交错 little-endian 16-bit PCM，经有界分块和 ALAC 编码后送入 RAOP RTP；CLI 用 `--pcm-stdin` 验证该路径。真实 MiPlay 网络会话仍需将解出的 PCM 帧接到该入口。
+- `mi2play-miplay` 现在提供 8899 TCP listener/session：按 FusionPlay.MiPlaySdk 的 9-byte framed protocol 处理 SafetyAuth/AES-CBC/HMAC、控制命令和 `OPEN`，再协商 RTSP WFD 的 RTP/MP2T/TCP 媒体流。
+- RTP 中的 MPEG-TS/PES/AAC-LC 会解码为 48 kHz 双声道 PCM，并通过事件通道交给 `PcmToRaop`；此前伪造的 `PCM_AUDIO_COMMAND` 路径已删除。
+- CLI 会通过 `mdns-sd` 广播带稳定实例名和 TXT 能力字段的
+  `_lyra-mdns._udp.local.` 与 `_mi-connect._udp.local.`；`_mi-connect` 的
+  SRV 发现端口为 UDP 56666，真实 TCP 8899 控制端口通过 `appsData` 描述；
+  程序同时监听 UDP 56666 接收发现探测。两个服务使用独立的稳定实例名和
+  对应的 MiPlay TXT 身份字段。
+- RAOP ANNOUNCE 使用固定 AirPlay RSA 公钥封装随机 AES-128 key/IV，RTP ALAC payload 按 AES-CBC 加密，并发送标准 RTP-Info/设备标识头；这不是 AirPlay 2/HAP Pair-Verify 配对。
+- AirPlay 1 已支持 RTSP Digest/密码认证、RTP timing 响应、control 丢包请求和 512 包重传缓存，并可浏览 `_raop._tcp` 自动选择播放器。
+- 播放期间每秒发送 RTP sync 包，并维护当前音频 RTP timestamp；timing 响应使用接收端请求的 `send_time` 作为 reference。
+- RAOP 客户端会在 ANNOUNCE 发送随机 `Apple-Challenge`，并校验接收端返回的 `Apple-Response`；客户端不需要 AirPlay RSA 私钥。真实设备集成测试仍需完成。SafetyAuth 的兼容会话不等同于小米官方设备准入。
 - 不承诺视频/镜像、DLNA、Chromecast、Sonos 特有行为。
 - 不把参考实现中的私有认证密钥、设备证书或未公开字段当作稳定 API。
